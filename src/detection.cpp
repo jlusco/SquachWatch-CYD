@@ -1,14 +1,9 @@
 // SquachWatch-CYD — DetectionEngine implementation
 #include "detection.h"
-#include "wardrive.h"
-#include "wifi_auth.h"
-#include "serial_flush.h"
 #include "signatures.h"
 #include "settings.h"
 #include "blackbox.h"
 #include "bingo.h"
-#include "dex.h"
-#include "regulars.h"
 #include "clock.h"
 #include <Arduino.h>
 #include <WiFi.h>
@@ -41,11 +36,7 @@ static DetectionEngine* g_engine = nullptr;
 // -------- manual raw scanner state (see startRawBleScan/startRawWifiScan) --------
 // NONE = normal continuous signature-matched scanning (the default).
 // Only one of these is ever active at a time -- see stopRawScan().
-// REST is the watch's radio duty cycle: WiFi stopped, BLE scanning stopped
-// or left running (s_restBle). Detections that do arrive are handled as
-// usual, which is what sets it apart from UPDATE.
-enum class RawScanMode : uint8_t { NONE, BLE, WIFI, UPDATE, REST };
-static bool g_restBle = false;   // REST: is the BLE scan resting too?
+enum class RawScanMode : uint8_t { NONE, BLE, WIFI, UPDATE };
 static RawScanMode g_rawMode        = RawScanMode::NONE;
 static uint32_t    g_rawBleStartMs  = 0;
 // How long a raw BLE sweep stays open before the UI is told it's
@@ -88,116 +79,11 @@ static volatile uint32_t s_advRaw = 0;   // every advert the radio handed over, 
 static volatile uint32_t s_advKind[5] = { 0, 0, 0, 0, 0 };
 const volatile uint32_t* advertKinds() { return s_advKind; }
 static volatile uint32_t s_wifiRaw = 0;  // every frame the sniffer was handed
-// Frames heard on each channel since the hop onto it, and how busy each one
-// has been lately: frames a second, times 16, smoothed over visits. See
-// hopChannel().
-static volatile uint16_t s_chanFrames[14];
-static uint16_t          s_chanRate[14];
-#if defined(TWATCH_S3)
-// Two 512-bit memories of Bluetooth addresses, by hash: this five minutes
-// and the five before. An address in neither is an arrival. A collision
-// only ever hides one, and the count is a nudge, not a detection.
-static uint8_t           s_seenNow[64], s_seenPrev[64];
-static volatile uint32_t s_bleArrivals = 0;
-uint32_t bleArrivals() { return s_bleArrivals; }
-void bleArrivalsRoll(uint32_t now) {
-    static uint32_t at = 0;
-    if (now - at < 300000u) return;
-    at = now;
-    memcpy(s_seenPrev, s_seenNow, sizeof s_seenPrev);
-    memset(s_seenNow, 0, sizeof s_seenNow);
-}
-static void noteBleAddress(const uint8_t* a) {
-    uint32_t h = 2166136261u;
-    for (uint8_t i = 0; i < 6; i++) h = (h ^ a[i]) * 16777619u;
-    const uint16_t ix = (uint16_t)(h & 511u);
-    const uint8_t byte = (uint8_t)(ix >> 3), bit = (uint8_t)(1u << (ix & 7));
-    if (s_seenNow[byte] & bit) return;
-    s_seenNow[byte] |= bit;
-    if (!(s_seenPrev[byte] & bit)) s_bleArrivals++;
-}
-#endif
 uint32_t wifiFramesSeen() { return s_wifiRaw; }
 uint32_t advertsSeen()    { return s_advRaw; }
-
-// The RADIO console command: what the radios are doing right now, so a boot
-// that hears and a boot that does not can be compared side by side. With
-// "SCAN" it also runs the driver's own WiFi scan (sniffer paused for it).
-char g_bootRadioLine[192] = "";
-void radioReport(bool withScan) {
-    if (g_bootRadioLine[0]) Serial.printf("[radio] boot: %s\n", g_bootRadioLine);
-    Serial.printf("[radio] power saver %s, radio duty %s (set to %s)\n", Settings::powerSaver() ? "ON" : "OFF",
-                  Settings::radioDutyName(Settings::radioDuty()), Settings::radioDutyName(Settings::radioDutyRaw()));
-    wifi_mode_t mode = WIFI_MODE_NULL;
-    const esp_err_t me = esp_wifi_get_mode(&mode);
-    bool promisc = false;
-    esp_wifi_get_promiscuous(&promisc);
-    uint8_t ch = 0; wifi_second_chan_t ch2 = WIFI_SECOND_CHAN_NONE;
-    esp_wifi_get_channel(&ch, &ch2);
-    int8_t txp = 0;
-    esp_wifi_get_max_tx_power(&txp);
-    wifi_country_t cc = {};
-    esp_wifi_get_country(&cc);
-    Serial.printf("[radio] wifi: mode %d (err %d), sniffer %s, channel %u, tx max %d, country %.2s %u-%u, frames %lu\n",
-                  (int)mode, (int)me, promisc ? "on" : "off", (unsigned)ch, (int)txp, cc.cc,
-                  (unsigned)cc.schan, (unsigned)(cc.schan + cc.nchan - 1), (unsigned long)s_wifiRaw);
-    NimBLEScan* sc = NimBLEDevice::getScan();
-    Serial.printf("[radio] ble: init %d, scanning %d, adverts %lu, raw mode %d, chip %.1f C, up %lu s\n",
-                  (int)NimBLEDevice::isInitialized(), sc ? (int)sc->isScanning() : -1,
-                  (unsigned long)s_advRaw, (int)g_rawMode, temperatureRead(), (unsigned long)(millis() / 1000));
-    {
-        char line[160];
-        int n = snprintf(line, sizeof line, "[radio] channel busyness, frames/s:");
-        for (uint8_t c = 1; c <= 13; c++) n += snprintf(line + n, sizeof line - n, " %u:%u", (unsigned)c, (unsigned)(s_chanRate[c] / 16));
-#if defined(TWATCH_S3)
-        snprintf(line + n, sizeof line - n, "; BLE arrivals %lu", (unsigned long)s_bleArrivals);
-#endif
-        Serial.println(line);
-    }
-    if (!withScan) return;
-    esp_wifi_set_promiscuous(false);
-    wifi_scan_config_t cfg = {};
-    cfg.show_hidden = true;
-    cfg.scan_type = WIFI_SCAN_TYPE_PASSIVE;
-    cfg.scan_time.passive = 150;
-    const uint32_t t0 = millis();
-    const esp_err_t se = esp_wifi_scan_start(&cfg, true);
-    uint16_t n = 0;
-    esp_wifi_scan_get_ap_num(&n);
-    int8_t best = -127;
-    if (n) {
-        uint16_t k = n > 20 ? 20 : n;
-        wifi_ap_record_t recs[20];
-        esp_wifi_scan_get_ap_records(&k, recs);
-        for (uint16_t i = 0; i < k; i++) if (recs[i].rssi > best) best = recs[i].rssi;
-    } else {
-        esp_wifi_clear_ap_list();
-    }
-    Serial.printf("[radio] driver scan: err %d, %u network(s), strongest %d dBm, %lu ms\n",
-                  (int)se, (unsigned)n, n ? (int)best : 0, (unsigned long)(millis() - t0));
-    esp_wifi_set_promiscuous(true);
-    esp_wifi_set_channel(ch ? ch : 1, WIFI_SECOND_CHAN_NONE);
-}
 static volatile uint8_t s_windowReq = 0;   // a WINDOW command waiting for the next restart
 static bool             s_windowPending = false;
 void setScanWindow(uint8_t w) { if (w >= 1 && w <= 100) { s_windowReq = w; s_windowPending = true; } }
-static uint8_t s_baseWindow = 75;   // matches the setWindow(75) at init
-static bool    s_boosted    = false;
-void setScanWindowBase(uint8_t w) {
-    if (w < 1 || w > 100 || w == s_baseWindow) return;
-    s_baseWindow = w;
-    if (!s_boosted) setScanWindow(w);
-}
-void setScanBoost(bool on) {
-    s_boosted = on;
-    setScanWindow(on ? 99 : s_baseWindow);
-}
-// BENCH: INTERVAL N (ms), with the window in the same message; see scanFlushOnHost.
-static volatile uint16_t s_intervalReq = 0;
-void setScanInterval(uint16_t ms, uint8_t w) {
-    if (ms < 20 || ms > 1000 || w < 1 || w > ms) return;
-    s_intervalReq = ms; s_windowReq = w; s_windowPending = true;
-}
 static volatile uint8_t s_scanPin = 0;   // 0 auto, 1 active, 2 passive -- the bench's say
 void setScanPin(uint8_t pin) { s_scanPin = pin > 2 ? 0 : pin; }
 
@@ -211,9 +97,6 @@ class BleScanCallbacks : public NimBLEScanCallbacks {
     // quiet room right up to the crash.
     void onDiscovered(const NimBLEAdvertisedDevice* adv) override {
         s_advRaw++;
-#if defined(TWATCH_S3)
-        noteBleAddress(adv->getAddress().getBase()->val);
-#endif
         const uint8_t t = adv->getAdvType();
         s_advKind[t == BLE_HCI_ADV_TYPE_ADV_IND ? 0 : t == BLE_HCI_ADV_TYPE_ADV_DIRECT_IND_HD ? 1 :
                   t == BLE_HCI_ADV_TYPE_ADV_SCAN_IND ? 2 : t == BLE_HCI_ADV_TYPE_ADV_NONCONN_IND ? 3 : 4]++;
@@ -282,30 +165,6 @@ class BleScanCallbacks : public NimBLEScanCallbacks {
             }
         }
 #endif
-        // Printed order from here on (issue #22). NimBLE keeps an address
-        // least-significant byte first, so every Bluetooth address this board
-        // showed was backwards next to a phone app or Home Assistant. Flipped
-        // here, after the squad above: its peers name each other in NimBLE's
-        // own order, in the sealed hello, and that must not change under it.
-        // Lists saved before this still match -- see IgnoreList, Regulars and
-        // BlackBox::forEachDetection.
-        uint8_t printed[6];
-        for (int i = 0; i < 6; i++) printed[i] = mac[5 - i];
-        mac = printed;
-#if defined(TWATCH_S3)
-        // Wardriving: every device, not just the ones worth an alert. The
-        // name and the company ID are only asked for while it is on -- both
-        // cost a string on this task.
-        if (Wardrive::enabled()) {
-            const std::string nm = adv->haveName() ? adv->getName() : std::string();
-            bool hasId = false; uint16_t cid = 0;
-            if (adv->haveManufacturerData()) {
-                const std::string md = adv->getManufacturerData();
-                if (md.size() >= 2) { hasId = true; cid = (uint16_t)((uint8_t)md[0] | ((uint8_t)md[1] << 8)); }
-            }
-            Wardrive::noteBle(mac, nm.c_str(), (int8_t)adv->getRSSI(), hasId, cid);
-        }
-#endif
         if (!g_engine) return;
         // Checked regardless of raw-scan mode -- a watched/hunted
         // target still fires even if it's not a known signature and
@@ -322,10 +181,7 @@ class BleScanCallbacks : public NimBLEScanCallbacks {
             memset(&r, 0, sizeof(r));
             memcpy(r.mac, mac, 6);
             r.rssi = adv->getRSSI();
-            // Held, not borrowed: getName() returns a temporary, and a pointer
-            // into it dangles by the next line (issue #22).
-            const std::string advName = adv->getName();
-            const char* name = advName.c_str();
+            const char* name = adv->getName().c_str();
             if (name && name[0]) strncpy(r.name, name, sizeof(r.name) - 1);
             g_engine->postRawBle(r);
             return;
@@ -338,11 +194,7 @@ class BleScanCallbacks : public NimBLEScanCallbacks {
         det.firstSeen = det.lastSeen = millis();
         det.hits   = 1;
         det.active = true;
-        // Held for the same reason as the raw scan's above. Borrowed, a
-        // nameless device read freed memory as its name -- and a garbage name
-        // that happened to be ten digits was logged as a Flock battery (#22).
-        const std::string advName = adv->getName();
-        const char* name = advName.c_str();
+        const char* name = adv->getName().c_str();
         if (name && name[0]) {
             strncpy(det.name, name, sizeof(det.name) - 1);
         }
@@ -404,16 +256,6 @@ class BleScanCallbacks : public NimBLEScanCallbacks {
             det.type = DetectionType::AIRTAG;
         }
 
-        // Remote ID (issue #15). A real drone's advert is its service data and
-        // nothing else -- the 25-byte message fills all 31 bytes -- so 0xFFFA
-        // never appears in the UUID list the check below reads, and matching
-        // only there meant no real drone was ever reported.
-        if (det.type == DetectionType::UNKNOWN &&
-            RemoteId::present(adv->getPayload().data(), (uint8_t)adv->getPayload().size())) {
-            det.type = DetectionType::DRONE;
-            label    = uuidName(0xFFFA);
-        }
-
         // Service UUIDs
         if (det.type == DetectionType::UNKNOWN && adv->haveServiceUUID()) {
             for (int j = 0; j < adv->getServiceUUIDCount(); j++) {
@@ -441,27 +283,7 @@ class BleScanCallbacks : public NimBLEScanCallbacks {
                             break;
                         }
                     }
-                    // Raven's services run 0x3100-0x3500, not just the five
-                    // round ones above: 0x3101 and 0x3102 are the ones that
-                    // hand out its GPS position (Flock-You, issue #15).
-                    // getValue() is the 16-bit value's own bytes, little-endian.
-                    if (det.type == DetectionType::UNKNOWN && u.getValue()) {
-                        const uint8_t* p = u.getValue();
-                        const uint16_t v = (uint16_t)(p[0] | (p[1] << 8));
-                        if (v >= 0x3100 && v <= 0x3500) {
-                            det.type = DetectionType::RAVEN;
-                            label    = uuidName(0x3100);
-                        }
-                    }
                     if (det.type != DetectionType::UNKNOWN) break;
-                } else if (u.bitSize() == 128) {
-                    // The Flock accessory service, from the GATT definition
-                    // in a Flock camera's firmware (Flock-You, issue #15).
-                    static const NimBLEUUID kFlockGatt("e8ccbb38-9532-46a8-9fe5-1814df172e6f");
-                    if (u.equals(kFlockGatt)) {
-                        det.type = DetectionType::FLOCK;   // labelled Flock-BLE below, like every Flock advert
-                        break;
-                    }
                 }
             }
         }
@@ -485,11 +307,6 @@ class BleScanCallbacks : public NimBLEScanCallbacks {
         // "Flipper", which is a string, not a signature.
         if (det.type == DetectionType::HACKER) {
             det.conf = matchedByName ? Confidence::MED_CONF : Confidence::HIGH_CONF;
-        }
-        // A bare ten-digit name is how one Penguin firmware names itself, and
-        // also something any gadget could be called. Logged, but LOW.
-        if (det.type == DetectionType::FLOCK && matchedByName && isBareSerialName(det.name)) {
-            det.conf = Confidence::LOW_CONF;
         }
         // A Remote ID advert carries far more than the fact that it exists.
         // Decode it before the entry is posted so the log row can be named
@@ -592,18 +409,9 @@ bool DetectionEngine::init() {
     // the step that might brown the board out -- because a brownout leaves no
     // crash dump and the reset reason alone does not say which of the two it
     // was. A board that boot-loops prints the last one it reached.
-#if defined(TWATCH_S3)
-    // Not on the watch. It has the heap to spare, and tearing the driver down
-    // 50 ms after WiFi.mode() started it -- while the radio may still be
-    // calibrating -- is the leading suspect for its deaf boots (2026-09-24:
-    // deaf through resets, reflashes and a power cut, while the bare stock
-    // sketch on the same watch heard 15 networks the same minute).
-    static const bool SLIM_WIFI = false;
-#else
     static const bool SLIM_WIFI = true;    // A/B on the bench: 45 frames/40 s slim, 20/45 s stock
-#endif
     Serial.println("[boot] starting WiFi");
-    serialFlush();
+    Serial.flush();
     Serial.printf("[boot] heap before WiFi: %lu free, %lu largest\n", (unsigned long)ESP.getFreeHeap(), (unsigned long)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
     WiFi.mode(WIFI_STA);
     WiFi.disconnect();
@@ -618,21 +426,6 @@ bool DetectionEngine::init() {
     if (SLIM_WIFI) {
         esp_wifi_stop();
         esp_wifi_deinit();
-        // A tick between the teardown and the rebuild. On the ESP32-S3
-        // (arduino-esp32 2.0.14) esp_wifi_deinit() returns before the last of
-        // the teardown has run on its task, and an esp_wifi_init() in the
-        // same tick races it: the driver comes up with the RECEIVER OFF --
-        // scans find no networks and the sniffer no frames, in every
-        // configuration, while transmitting works and the BLE receiver next to
-        // it hears everything. Bisected on an Elecrow CrowPanel 7 (S3) on
-        // 2026-09-23: zero delay here was deaf on every boot; delay(1) heard
-        // on 3/3, delay(10) 3/3, delay(50) 3/3, with nothing else changed --
-        // and a delay placed BEFORE the stop (50 ms to 3 s) does nothing. It
-        // is also why a boot that did something slow first (the touch
-        // calibration, an earlier Arduino WiFi.mode) hears the room: a driver
-        // that has settled tears down synchronously. The classic ESP32 never
-        // showed it. Ten milliseconds is the margin.
-        delay(10);
         wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
         cfg.static_rx_buf_num  = 2;    // the DMA landing zone; 2 is the floor
         cfg.dynamic_rx_buf_num = 16;
@@ -667,10 +460,6 @@ bool DetectionEngine::init() {
         s_wifiRaw++;
         if (!g_engine) return;
         const wifi_promiscuous_pkt_t* pkt = (const wifi_promiscuous_pkt_t*)buf;
-        {
-            const uint8_t ch = pkt->rx_ctrl.channel;
-            if (ch >= 1 && ch <= 13 && s_chanFrames[ch] < 0xFFFF) s_chanFrames[ch]++;
-        }
         if (pkt->rx_ctrl.sig_len < 24) return;
         // 802.11 frame header: bytes 0..23 contain frame control, duration,
         // addr1 (DA, offset 4), addr2 (SA, offset 10), addr3 (BSSID, offset 16)
@@ -716,25 +505,8 @@ bool DetectionEngine::init() {
             // device announcing itself to its own kind, not an access point
             // offering a network, and its SSID is throwaway. Its name goes
             // where the SSID would have.
-#if defined(TWATCH_S3)
-            // Wardriving: every access point, with its security read from the
-            // RSN and WPA elements (the last four bytes are the FCS).
-            if (Wardrive::enabled() && sigLen > 40) {
-                const uint16_t cap = (uint16_t)(frame[34] | (frame[35] << 8));
-                Wardrive::noteWifi(frame + 16, ssid, WifiAuth::parse(cap, frame + 36, (uint16_t)(sigLen - 40)),
-                                   pkt->rx_ctrl.channel, (int8_t)pkt->rx_ctrl.rssi);
-            }
-#endif
             char pwnName[33];
-            // A drone's WiFi Remote ID rides in its beacons as a vendor
-            // element (issue #15): posted as a drone, named by its serial
-            // when the pack carried its Basic ID. The last four bytes of
-            // sig_len are the frame check sequence, not elements.
-            RemoteId::Info rid;
-            if (sigLen > 40 && RemoteId::mergeBeacon(frame + 36, (uint16_t)(sigLen - 40), rid, 0)) {
-                g_engine->postWiFi(frame + 10, pkt->rx_ctrl.rssi, pkt->rx_ctrl.channel,
-                                   rid.haveBasic ? rid.serial : "", false, false, true);
-            } else if (pwnagotchiName(frame, sigLen, pwnName, sizeof(pwnName))) {
+            if (pwnagotchiName(frame, sigLen, pwnName, sizeof(pwnName))) {
                 g_engine->postWiFi(frame + 10, pkt->rx_ctrl.rssi,
                                    pkt->rx_ctrl.channel, pwnName, false, true);
             } else {
@@ -762,7 +534,7 @@ bool DetectionEngine::init() {
     Serial.printf("[boot] heap with WiFi up: %lu free, %lu largest\n",
                   (unsigned long)s_bootHeap.wifiFree, (unsigned long)s_bootHeap.wifiLargest);
     Serial.println("[boot] starting Bluetooth");
-    serialFlush();
+    Serial.flush();
     NimBLEDevice::init("");
     NimBLEScan* scan = NimBLEDevice::getScan();
     // Passive to start, whatever the room: the first second of an active
@@ -995,9 +767,7 @@ static void setAdvertising(bool on, uint32_t now) {
 
 void radioTick(uint32_t now) {
     // Update mode owns the advertiser; see DetectionEngine::startUpdateRadio().
-    // Resting radios have nothing to advertise with unless BLE stayed up.
     if (g_rawMode == RawScanMode::UPDATE) return;
-    if (g_rawMode == RawScanMode::REST && g_restBle) return;
     // Our own address goes into the nonce of every message we send, so the
     // runtime needs it -- read once, after the stack is up, and copied out of
     // a named NimBLEAddress rather than through a pointer into a temporary.
@@ -1101,8 +871,7 @@ static void scanFlushOnHost(struct ble_npl_event*) {
     NimBLEScan* scan = NimBLEDevice::getScan();
     // Checked again here: a raw scan may have started, or scanning been
     // switched off, between the post and now.
-    if ((g_rawMode != RawScanMode::NONE && !(g_rawMode == RawScanMode::REST && !g_restBle)) ||
-        !scan || !scan->isScanning()) return;
+    if (g_rawMode != RawScanMode::NONE || !scan || !scan->isScanning()) return;
     // Measured across the stop alone -- start() may allocate, and that is not
     // what this number is for.
     const uint32_t before = ESP.getFreeHeap();
@@ -1112,7 +881,6 @@ static void scanFlushOnHost(struct ble_npl_event*) {
     // a start, which is why the decision is carried in here.
     const uint32_t nowMs = millis();
     (void)nowMs;
-    if (s_intervalReq) { scan->setInterval(s_intervalReq); s_intervalReq = 0; }
     if (s_windowReq) { scan->setWindow(s_windowReq); s_windowReq = 0; }
     const bool passive = s_wantPassive;
     if (passive != s_passiveNow) { scan->setActiveScan(!passive); s_passiveNow = passive; }
@@ -1212,9 +980,7 @@ static void scanFlushTick() {
 }
 
 void DetectionEngine::loop() {
-    // Resting radios still take the BLE side of the loop when BLE is up;
-    // only the WiFi steps below are skipped, since WiFi is stopped.
-    if (g_rawMode != RawScanMode::NONE && g_rawMode != RawScanMode::REST) {
+    if (g_rawMode != RawScanMode::NONE) {
         // A raw scan owns the radio right now -- channel hopping here
         // would fight WiFi.scanNetworks()'s own hopping during a WIFI
         // sweep, and the WiFi promiscuous queue is empty anyway (it's
@@ -1226,30 +992,10 @@ void DetectionEngine::loop() {
     // After the raw-scan return above, so a raw scan that owns the radio is
     // never restarted out from under it.
     scanFlushTick();
-    if (g_rawMode != RawScanMode::REST) {
-        hopChannel();
-        processWiFiQ();
-        processDeauthQ();
-    }
+    hopChannel();
+    processWiFiQ();
+    processDeauthQ();
     expireStale();
-    // A flood too fast for its fakes to go stale: more new addresses of one
-    // type in a minute than a crowd makes. Counted on the host task in
-    // pushLog, read here once a minute; a lost increment is one fake fewer.
-    {
-        static uint32_t at = 0;
-        static uint16_t seen[SpamWatch::TYPES];
-        const uint32_t now = millis();
-        if (now - at >= 60000) {
-            at = now;
-            for (uint8_t k = 0; k < SpamWatch::TYPES; k++) {
-                const uint16_t n = _newBle[k], fresh = (uint16_t)(n - seen[k]);
-                seen[k] = n;
-                if (_spam.noteBurst(k, fresh, now))
-                    Serial.printf("[spam] %s flood: %u new addresses in a minute; one alert, then quiet\n",
-                                  detectionTypeName((DetectionType)k), (unsigned)fresh);
-            }
-        }
-    }
     decayChannelActivity();
     saveLifetime(millis());
     drainBlackBox(millis());
@@ -1271,48 +1017,15 @@ void DetectionEngine::decayChannelActivity() {
 }
 
 void DetectionEngine::hopChannel() {
-    // Cycling 1-13 -- without this the promiscuous sniffer stays parked on
-    // whatever channel the radio defaulted to and only ever sees traffic on
-    // that one channel, missing anything (real hardware included, not just
-    // test rigs) transmitting elsewhere in the band.
-    //
-    // Not an even 300 ms each any more. Most of a building's WiFi sits on
-    // two or three channels and the rest are often silent, so the busy ones
-    // get more of the sweep and the silent ones a quick look. The sweep
-    // still takes about four seconds, so the watch's five-second window
-    // still sees every channel; the shortest look still outlasts a router's
-    // beacon interval (about 100 ms).
-    const uint32_t now = millis();
-    if (now - _lastHopMs < _dwellMs) return;
-    {
-        // How busy the channel being left was: frames a second, times 16.
-        // A visit that ran long (the loop was held up, or the radios were
-        // resting) says nothing fair, so it is not scored.
-        const uint32_t spent = now - _lastHopMs;
-        const uint32_t f = s_chanFrames[_wifiChannel];
-        s_chanFrames[_wifiChannel] = 0;
-        if (spent <= 2u * _dwellMs + 200u) {
-            uint32_t rate = f * 16000u / (spent ? spent : 1);
-            if (rate > 0xFFFFu) rate = 0xFFFFu;
-            s_chanRate[_wifiChannel] = (uint16_t)(((uint32_t)s_chanRate[_wifiChannel] * 3u + rate) / 4u);
-        }
-    }
+    // Dwell ~300ms per channel, cycling 1-13 — without this the
+    // promiscuous sniffer stays parked on whatever channel the radio
+    // defaulted to and only ever sees traffic on that one channel,
+    // missing anything (real hardware included, not just test rigs)
+    // transmitting elsewhere in the band.
+    uint32_t now = millis();
+    if (now - _lastHopMs < 300) return;
     _lastHopMs = now;
     _wifiChannel = (_wifiChannel % 13) + 1;
-    s_chanFrames[_wifiChannel] = 0;
-    // Shares: 4 for a channel at least a quarter as busy as the busiest,
-    // 2 for one with anything on it, 1 for a silent one. Split 3.9 s.
-    uint16_t top = 0;
-    for (uint8_t c = 1; c <= 13; c++) if (s_chanRate[c] > top) top = s_chanRate[c];
-    uint16_t total = 0, mine = 2;
-    for (uint8_t c = 1; c <= 13; c++) {
-        const uint16_t r = s_chanRate[c];
-        const uint16_t sh = !top ? 2 : (r * 4u >= top ? 4 : (r ? 2 : 1));
-        total += sh;
-        if (c == _wifiChannel) mine = sh;
-    }
-    _dwellMs = (uint16_t)(3900u * mine / total);
-    if (_dwellMs < 120) _dwellMs = 120;
     esp_wifi_set_channel(_wifiChannel, WIFI_SECOND_CHAN_NONE);
 }
 
@@ -1327,7 +1040,7 @@ void DetectionEngine::clearLog() {
 
 void IRAM_ATTR DetectionEngine::postWiFi(const uint8_t* mac, int8_t rssi, uint8_t channel,
                                          const char* ssid, bool encrypted,
-                                         bool pwnagotchi, bool drone) {
+                                         bool pwnagotchi) {
     if (!mac) return;
     // Group-addressed (broadcast/multicast) destinations can never be a
     // real device: bit 0 of byte 0 is the I/G bit, and every OUI in
@@ -1358,7 +1071,6 @@ void IRAM_ATTR DetectionEngine::postWiFi(const uint8_t* mac, int8_t rssi, uint8_
     }
     e.encrypted = encrypted;
     e.pwnagotchi = pwnagotchi;
-    e.drone      = drone;
     _wifiQHead = next;
 }
 
@@ -1416,35 +1128,6 @@ void DetectionEngine::processDeauthQ() {
             // or camera.
             d.hits   = _deauthWinCount;
             d.active = true;
-            // A second flood from the same source is the same attacker, so
-            // it lands on the row the first one made -- it used to push a
-            // fresh row per burst, and a noisy neighbour filled the LOG with
-            // copies of one MAC. It counts and alerts again, like any device
-            // that went quiet and came back.
-            for (uint8_t i = 0; i < _logCount; i++) {
-                const uint8_t slot = (_logHead + LOG_CAP - 1 - i) % LOG_CAP;
-                Detection& row = _log[slot];
-                if (row.type != DetectionType::DEAUTH || memcmp(row.mac, e.mac, 6) != 0) continue;
-                row.prevRssi  = row.rssi;
-                row.rssi      = e.rssi;
-                row.channel   = e.channel;
-                row.hits      = _deauthWinCount;
-                row.lastSeen  = now;
-                row.firstSeen = now;
-                row.restored  = 0;
-                if (!row.active) {
-                    row.active = true;
-                    _typeCounts[(uint8_t)DetectionType::DEAUTH]++;
-                }
-                Bingo::note(DetectionType::DEAUTH);
-                Dex::note(DetectionType::DEAUTH, e.rssi);
-                Regulars::note(e.mac, DetectionType::DEAUTH);
-                _latest = &row;
-                _latestNew = false;      // the row the first flood made
-                _latestChangeMs = now;
-                queueBlackBox(row, true);
-                return;
-            }
             pushLog(d);
         }
     }
@@ -1514,9 +1197,6 @@ void DetectionEngine::postBle(Detection d) {
             _log[slot].rssi = d.rssi;
             _log[slot].lastSeen = millis();
             Bingo::note(d.type);
-            Dex::note(d.type, d.rssi);
-    Regulars::note(d.mac, d.type);
-            Regulars::note(d.mac, d.type);
             if (reactivating) {
                 _log[slot].hits++;
                 _log[slot].active = true;
@@ -1524,7 +1204,6 @@ void DetectionEngine::postBle(Detection d) {
                 _log[slot].firstSeen = millis();   // fresh sighting for alert purposes
                 _typeCounts[(uint8_t)d.type]++;
                 _latest = &_log[slot];
-                _latestNew = false;                // ...but a device we had already
                 _latestChangeMs = millis();
                 queueBlackBox(_log[slot], true);
             }
@@ -1534,11 +1213,9 @@ void DetectionEngine::postBle(Detection d) {
     pushLog(d);
 }
 
-// Nothing calls this today (the Classic inquiry was never switched on), but
-// if something does, it gets the same MAC+type merge as BLE rather than a
-// new row per sighting.
 void DetectionEngine::postBtClassic(Detection d) {
-    postBle(d);
+    if (!Settings::typeEnabled(d.type)) return;
+    pushLog(d);
 }
 
 void DetectionEngine::postRawBle(RawBleResult r) {
@@ -1681,46 +1358,6 @@ void DetectionEngine::stopUpdateRadio() {
     esp_wifi_set_promiscuous(true);
     if (s_updEvReady) ble_npl_eventq_put(nimble_port_get_dflt_eventq(), &s_updStartEv);
 }
-
-// The watch's radio duty cycle. WiFi is stopped outright -- a started WiFi
-// radio draws most of its power just sitting there, and taking it out of
-// promiscuous mode alone saves almost nothing. BLE scanning stops too when
-// asked, or keeps going in the BLE-always mode, where trackers walking past
-// are the catches that cannot wait. Only from NONE: a raw scan or an update
-// owns the radio, and the cycle waits its turn.
-bool DetectionEngine::restRadios(bool bleToo) {
-    if (g_rawMode != RawScanMode::NONE) return false;
-    if (!s_updEvReady) {
-        ble_npl_event_init(&s_updStopEv,  updScanStopOnHost,  nullptr);
-        ble_npl_event_init(&s_updStartEv, updScanStartOnHost, nullptr);
-        s_updEvReady = true;
-    }
-    g_rawMode = RawScanMode::REST;
-    g_restBle = bleToo;
-    esp_wifi_set_promiscuous(false);
-    esp_wifi_stop();
-    if (bleToo) {
-#if SQUACH_MESH
-        Mesh::stopAdvertisingForUpdate();
-#endif
-        ble_npl_eventq_put(nimble_port_get_dflt_eventq(), &s_updStopEv);
-    }
-    return true;
-}
-
-void DetectionEngine::wakeRadios() {
-    if (g_rawMode != RawScanMode::REST) return;
-    g_rawMode = RawScanMode::NONE;
-    esp_wifi_start();
-    esp_wifi_set_promiscuous(true);
-    esp_wifi_set_channel(_wifiChannel, WIFI_SECOND_CHAN_NONE);
-    _lastHopMs = millis();                       // the visit starts now, not before the rest
-    s_chanFrames[_wifiChannel] = 0;
-    if (g_restBle && s_updEvReady) ble_npl_eventq_put(nimble_port_get_dflt_eventq(), &s_updStartEv);
-    g_restBle = false;
-}
-
-bool DetectionEngine::radiosResting() { return g_rawMode == RawScanMode::REST; }
 
 void DetectionEngine::watchBle(const uint8_t* mac, const char* name) {
     _watchKind = WatchKind::BLE;
@@ -1953,10 +1590,6 @@ void DetectionEngine::processWiFiQ() {
         if (e.pwnagotchi) {
             t = DetectionType::HACKER;
             conf = Confidence::HIGH_CONF;
-        } else if (e.drone) {
-            // The same claim the Bluetooth form makes, in the same bytes.
-            t = DetectionType::DRONE;
-            conf = confidenceFor(t);
         } else if ((evilTwin = (e.ssid[0] && noteApBeacon(e.mac, e.ssid, e.encrypted)))) {
             t = DetectionType::EVILTWIN;
         } else {
@@ -1990,8 +1623,6 @@ void DetectionEngine::processWiFiQ() {
                 _log[slot].type == t) {
                 bool reactivating = !_log[slot].active;
                 Bingo::note(t);
-                Dex::note(t, e.rssi);
-                Regulars::note(e.mac, t);
                 _log[slot].hits++;
                 {
                     const uint8_t nowAt = (uint8_t)(millis() >> 11);
@@ -2009,7 +1640,6 @@ void DetectionEngine::processWiFiQ() {
                     _log[slot].firstSeen = millis();
                     _typeCounts[(uint8_t)t]++;
                     _latest = &_log[slot];
-                    _latestNew = false;            // came back; not new to the log
                     _latestChangeMs = millis();
                     queueBlackBox(_log[slot], true);
                 }
@@ -2035,9 +1665,6 @@ void DetectionEngine::processWiFiQ() {
         } else if (e.pwnagotchi) {
             d.vendor = "Pwnagotchi";
             strncpy(d.name, e.ssid, sizeof(d.name) - 1);
-        } else if (e.drone) {
-            d.vendor = "DroneID";
-            strncpy(d.name, e.ssid, sizeof(d.name) - 1);   // its serial, when the pack had one
         } else if (matchedBySsid) {
             const char* name = ssidVendorName(e.ssid);
             if (name) d.vendor = name;
@@ -2065,10 +1692,8 @@ void DetectionEngine::pushLog(const Detection& d) {
     _logHead = (_logHead + 1) % LOG_CAP;
     if (_logCount < LOG_CAP) _logCount++;
     _latest = &_log[(_logHead + LOG_CAP - 1) % LOG_CAP];
-    _latestNew = true;      // the one place a row the log never held is made
     _latestChangeMs = millis();
     _typeCounts[(uint8_t)d.type]++;
-    if (d.channel == 0 && (uint8_t)d.type < SpamWatch::TYPES) _newBle[(uint8_t)d.type]++;
     _lifetimeTotal++;
     if ((uint8_t)d.type < (uint8_t)DetectionType::COUNT) _lifetimeByType[(uint8_t)d.type]++;
     // Counted here, on the Bluetooth host task, and written to flash from
@@ -2078,7 +1703,6 @@ void DetectionEngine::pushLog(const Detection& d) {
     // a bench flood of new trackers back the radio up until the heap went.
     _lifetimeDirty = true;
     Bingo::note(d.type);
-    Dex::note(d.type, d.rssi);
     const uint8_t next = (uint8_t)((_sdQHead + 1) % SD_Q_CAP);
     if (next != _sdQTail) { _sdQ[_sdQHead] = d; _sdQHead = next; }
     queueBlackBox(d, false);
@@ -2119,17 +1743,8 @@ void DetectionEngine::drainBlackBox(uint32_t now) {
     // every four. The ring only holds eighteen hundred sightings, so nothing
     // real is lost by capping it -- and a crowded festival stops wearing the
     // flash out at a hundred times the rate an ordinary day does.
-#if defined(CROWPANEL7)
-    // Sparser still on the CrowPanel, for the reason in saveLifetime(): each
-    // record is a flash write and a visible step. Two in a burst, then one
-    // every thirty seconds; the queue holds the rest and the ring keeps the
-    // same eighteen hundred sightings either way.
-    static const uint8_t  BURST = 2;
-    static const uint32_t EVERY = 30000;
-#else
     static const uint8_t  BURST = 6;
     static const uint32_t EVERY = 3000;
-#endif
     static uint8_t  tokens = BURST;
     static uint32_t filled = 0;
     if (!filled) filled = now;
@@ -2173,42 +1788,19 @@ void logDump() {
 // The lifetime tally, to flash: at most once every five seconds while it
 // has changed. Five seconds of counting is what a power cut can lose.
 void DetectionEngine::saveLifetime(uint32_t now) {
-#if defined(CROWPANEL7)
-    // Once a minute, not every five seconds. On the CrowPanel every flash
-    // write disables the cache the RGB panel's DMA reads its framebuffer
-    // through, and the picture steps sideways for it -- measured 2026-09-23:
-    // with this and the black-box drain below switched off the step went
-    // from "occasional" to "very rare". A crash costs under a minute of
-    // lifetime counts, which is what these are.
-    static const uint32_t LIFETIME_EVERY_MS = 60000;
-#else
-    static const uint32_t LIFETIME_EVERY_MS = 5000;
-#endif
-    if (!_lifetimeDirty || now - _lifetimeSavedMs < LIFETIME_EVERY_MS) return;
+    if (!_lifetimeDirty || now - _lifetimeSavedMs < 5000) return;
     _lifetimeDirty   = false;
     _lifetimeSavedMs = now;
     _prefs.putUInt("total", _lifetimeTotal);
     saveLifetimeByType();
 }
 
-static_assert((uint8_t)DetectionType::COUNT <= SpamWatch::TYPES, "SpamWatch is sized for 32 types");
-
 void DetectionEngine::expireStale() {
     uint32_t now = millis();
     for (uint8_t i = 0; i < _logCount; i++) {
         uint8_t slot = (_logHead + LOG_CAP - 1 - i) % LOG_CAP;
-        // Signed: lastSeen is written from the radio tasks and can land a
-        // moment after `now` was read.
-        if (_log[slot].active && (int32_t)(now - _log[slot].lastSeen) > (int32_t)STALE_MS) {
+        if (_log[slot].active && (now - _log[slot].lastSeen) > STALE_MS) {
             _log[slot].active = false;
-            // A Bluetooth address heard for a burst and never again is what a
-            // fake tag looks like; enough of one type and the type goes quiet.
-            {
-                const Detection& g = _log[slot];
-                if (g.channel == 0 && _spam.noteVanish((uint8_t)g.type, g.lastSeen - g.firstSeen, g.hits, now))
-                    Serial.printf("[spam] %s flood: short-lived addresses piling up; one alert, then quiet\n",
-                                  detectionTypeName(g.type));
-            }
             if (_typeCounts[(uint8_t)_log[slot].type] > 0) {
                 _typeCounts[(uint8_t)_log[slot].type]--;
             }

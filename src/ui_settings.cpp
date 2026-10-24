@@ -1,9 +1,5 @@
 // SquachWatch-CYD — settings screen implementation
 #include "ui_settings.h"
-#include "wardrive.h"
-#if SQUACH_LORA
-#include "ui_lorachat.h"
-#endif
 #include "ota_core.h"
 #include "ota_wifi.h"
 #include "theme.h"
@@ -12,8 +8,6 @@
 #include "ignore_list.h"
 #include "squachy.h"
 #include "bingo.h"
-#include "dex.h"
-#include "ui_dex.h"
 #include <Arduino.h>
 
 // Was 16, which put the first row's top edge 4px ABOVE the bottom of the
@@ -27,7 +21,7 @@ static const int TOP_MARGIN = 32;
 
 // One scroll position per page, not one shared: see SettingsPage in the header.
 static SettingsPage s_page = SettingsPage::MAIN;
-static int g_scrollFor[5] = { 0, 0, 0, 0, 0 };
+static int g_scrollFor[4] = { 0, 0, 0, 0 };
 #define g_scroll (g_scrollFor[(uint8_t)s_page])
 
 // BACK is pinned along the bottom now. Height of that strip, reserved out of
@@ -36,13 +30,15 @@ static int g_scrollFor[5] = { 0, 0, 0, 0, 0 };
 // strip, so a disagreement puts the last row under it, untappable.
 #define PINNED_BACK_H (Theme::pinnedBackH(screenW))
 
+// Which groups are folded shut. Session-only on purpose: a fold is a "get this
+// out of my way for a minute", not a preference worth surviving a reboot.
+static bool s_folded[6] = { false, false, false, false, false, false };
+
 // Whether a watch/hunt target exists. Set every tick from the engine, read by
 // buildDisplayList() -- which has no engine of its own, and is called by the
 // hit test as well as the draw. Same pattern ui_clear.cpp uses for its crowd.
 static bool s_hasWatch = false, s_hasHunt = false;
 static char s_watchLabel[24] = "", s_huntLabel[24] = "";
-// The DEX row's count, for the same reason.
-static uint8_t s_dexCaught = 0;
 
 // Fixed display order, grouped so a colored section header can sit
 // above each cluster (see groupFor()/RowGroupId below) -- CALIBRATE/
@@ -52,28 +48,8 @@ static uint8_t s_dexCaught = 0;
 // has turned off) are filtered out by visibleRows() below rather than
 // removed here, so their SettingsRow values stay stable regardless of
 // which mode is active.
-#if defined(FREENOVE_S3)
-void boardBatteryLine(char* out, size_t n);    // main.cpp: the divider on GPIO9
-#endif
-#if defined(TWATCH_S3)
-void twatchBatteryLine(char* out, size_t n);   // main.cpp, where the power chip lives
-uint8_t twatchGpsState();                      // main.cpp: 0 off, 1 starting, 2 no fix, 3 fix
-int  twatchChipC();                            // main.cpp: the chip's temperature, cached
-#endif
-
 static const SettingsRow ALL_ROWS[] = {
-#if defined(TWATCH_S3)
-    // The watch's own page, first: what only a watch has to think about grew
-    // to ten rows, so the main list carries one row that opens it.
-    SettingsRow::WATCH_SETTINGS,
-#endif
     SettingsRow::BORING_MODE, SettingsRow::CONFIDENCE, SettingsRow::AUTO_QUIET,
-#if defined(CROWPANEL7)
-    // Beside ALERT FILTER and AUTO SNOOZE because it is about alerts: one
-    // switch, not a page of knobs like the light. Compiled only for the
-    // board with a buzzer, so the emulator (no board macro) never lists it.
-    SettingsRow::BUZZER,
-#endif
     SettingsRow::DETECTION_FILTER,
     SettingsRow::IGNORED_DEVICES,
     // APPEARANCE opens the display page -- see APPEARANCE_ROWS. It sat at the
@@ -91,11 +67,8 @@ static const SettingsRow ALL_ROWS[] = {
     // -- see APPEARANCE_ROWS. Everything about how he LOOKS is on one page;
     // what stays here is what he DOES.
     SettingsRow::REPLAY_INTRO, SettingsRow::SHOW_OFF, SettingsRow::VIEW_DIARY,
-    SettingsRow::BINGO, SettingsRow::DEX, SettingsRow::DESK_MODE,
+    SettingsRow::BINGO, SettingsRow::DESK_MODE,
     SettingsRow::POWER_SAVER,
-#if defined(ESP32) && !defined(TWATCH_S3)
-    SettingsRow::CHARGE_MODE,
-#endif
     SettingsRow::SECURITY,
     // CALIBRATE, CHECK COLORS, DIAGNOSTICS and RESET STATS moved behind the
     // SYSTEM row -- see SYSTEM_ROWS. They are the four you touch once a year,
@@ -122,29 +95,8 @@ static const SettingsRow APPEARANCE_ROWS[] = {
     SettingsRow::STATUS_LIGHT,
 };
 
-#if defined(TWATCH_S3)
-// The WATCH SETTINGS page: the battery first (a reading), then the knobs that
-// decide how long it lasts, then the buzz, then the tools.
-static const SettingsRow WATCH_ROWS[] = {
-    SettingsRow::WATCH_BATTERY, SettingsRow::WATCH_WARDRIVE, SettingsRow::WATCH_QUIET_TAGS,
-#if SQUACH_LORA
-    SettingsRow::WATCH_LORA_CHATS, SettingsRow::WATCH_LORA,
-#endif
-    SettingsRow::WATCH_RADIO, SettingsRow::WATCH_LISTEN,
-    SettingsRow::WATCH_IDLE_CPU, SettingsRow::WATCH_BUZZ,
-    SettingsRow::WATCH_TEMP,
-};
-static const uint8_t WATCH_ROWS_N = sizeof(WATCH_ROWS) / sizeof(WATCH_ROWS[0]);
-#endif
-
 // The SYSTEM page: the rarely-needed machinery, off the main list.
 static const SettingsRow SYSTEM_ROWS[] = {
-#if defined(FREENOVE_S3)
-    SettingsRow::BOARD_BATTERY,
-#endif
-#if defined(ESP32) && !defined(TWATCH_S3)
-    SettingsRow::LAST_RUN,
-#endif
     SettingsRow::CALIBRATE, SettingsRow::CHECK_COLORS,
     SettingsRow::DIAGNOSTICS, SettingsRow::UPDATE_FIRMWARE, SettingsRow::UPDATE_CHECK, SettingsRow::WIFI_NETWORKS,
     SettingsRow::RESET_STATS,
@@ -170,9 +122,6 @@ static const uint8_t APPEARANCE_ROWS_N = sizeof(APPEARANCE_ROWS) / sizeof(APPEAR
 static const uint8_t LIST_MAX_N = APPEARANCE_ROWS_N > ALL_ROWS_N ? APPEARANCE_ROWS_N : ALL_ROWS_N;
 static_assert(SYSTEM_ROWS_N <= LIST_MAX_N, "the display list is sized off LIST_MAX_N");
 static_assert(DESK_ROWS_N <= LIST_MAX_N, "the display list is sized off LIST_MAX_N");
-#if defined(TWATCH_S3)
-static_assert(WATCH_ROWS_N <= LIST_MAX_N, "the display list is sized off LIST_MAX_N");
-#endif
 // Kept as a thin shim over s_page so nothing that reads it has to change.
 #define s_appearance (s_page == SettingsPage::APPEARANCE)
 
@@ -198,7 +147,7 @@ static bool isSquachyOnlyRow(SettingsRow r) {
            r == SettingsRow::PET || r == SettingsRow::TOP_HAT;
 }
 
-enum class RowGroupId : uint8_t { APPEARANCE, BEHAVIOR, SQUACHY, SYSTEM, DESK, SQUAD, WATCH };
+enum class RowGroupId : uint8_t { APPEARANCE, BEHAVIOR, SQUACHY, SYSTEM, DESK, SQUAD };
 
 static RowGroupId groupFor(SettingsRow r) {
     // Appearance sits with the Squachy rows because that is where it was asked
@@ -209,18 +158,6 @@ static RowGroupId groupFor(SettingsRow r) {
     // part that matters, since the display rows live behind it.
     if (r == SettingsRow::APPEARANCE && Settings::boringMode()) return RowGroupId::SYSTEM;
     switch (r) {
-        case SettingsRow::WATCH_BATTERY:
-        case SettingsRow::WATCH_RADIO:
-        case SettingsRow::WATCH_LISTEN:
-        case SettingsRow::WATCH_IDLE_CPU:
-        case SettingsRow::WATCH_BUZZ:
-        case SettingsRow::WATCH_SETTINGS:
-        case SettingsRow::WATCH_TEMP:
-        case SettingsRow::WATCH_WARDRIVE:
-        case SettingsRow::WATCH_LORA:
-        case SettingsRow::WATCH_LORA_CHATS:
-        case SettingsRow::WATCH_QUIET_TAGS:
-            return RowGroupId::WATCH;
         // TIME ZONE sat on the SYSTEM page too, the same setting twice. Only
         // the clock reads it, so it lives with the clock.
         case SettingsRow::TIME_ZONE:
@@ -255,9 +192,6 @@ static RowGroupId groupFor(SettingsRow r) {
         case SettingsRow::BORING_MODE:
         case SettingsRow::CONFIDENCE:
         case SettingsRow::AUTO_QUIET:
-#if defined(CROWPANEL7)
-        case SettingsRow::BUZZER:
-#endif
         case SettingsRow::DETECTION_FILTER:
         case SettingsRow::IGNORED_DEVICES:
             return RowGroupId::BEHAVIOR;
@@ -267,7 +201,6 @@ static RowGroupId groupFor(SettingsRow r) {
         case SettingsRow::REPLAY_INTRO:
         case SettingsRow::VIEW_DIARY:
         case SettingsRow::BINGO:
-        case SettingsRow::DEX:
         case SettingsRow::DESK_MODE:
         case SettingsRow::SHOW_OFF:
             return RowGroupId::SQUACHY;
@@ -283,7 +216,6 @@ static const char* groupName(RowGroupId g) {
         case RowGroupId::SQUACHY:    return "SQUACHY";
         case RowGroupId::DESK:       return "DESK";
         case RowGroupId::SQUAD:      return "SQUAD";
-        case RowGroupId::WATCH:      return "WATCH";
         default:                     return "SYSTEM";
     }
 }
@@ -298,7 +230,6 @@ static uint16_t groupColor(RowGroupId g) {
         case RowGroupId::SQUACHY:    return Theme::VAPOR_PINK;
         case RowGroupId::DESK:       return Theme::CYAN;
         case RowGroupId::SQUAD:      return Theme::GREEN;
-        case RowGroupId::WATCH:      return Theme::AMBER;
         default:                     return Theme::VAPOR_PURPLE;
     }
 }
@@ -322,9 +253,6 @@ static uint8_t buildDisplayList(DisplayItem* out) {
     if (s_page == SettingsPage::APPEARANCE) { src = APPEARANCE_ROWS; srcN = APPEARANCE_ROWS_N; }
     else if (s_page == SettingsPage::SYSTEM) { src = SYSTEM_ROWS;    srcN = SYSTEM_ROWS_N; }
     else if (s_page == SettingsPage::DESK)   { src = DESK_ROWS;      srcN = DESK_ROWS_N; }
-#if defined(TWATCH_S3)
-    else if (s_page == SettingsPage::WATCH)  { src = WATCH_ROWS;     srcN = WATCH_ROWS_N; }
-#endif
     // The tracking rows come first on the main page, and only when a target is
     // actually set -- the whole point is that a watch stops being invisible.
     if (s_page == SettingsPage::MAIN) {
@@ -366,6 +294,9 @@ static uint8_t buildDisplayList(DisplayItem* out) {
             lastGroup = g;
             haveLastGroup = true;
         }
+        // Folded: the heading is still drawn (that is what you tap to unfold),
+        // its rows are not.
+        if (s_folded[(uint8_t)g]) continue;
         out[count].isHeader = false;
         out[count].group = g;
         out[count].row = rows[i];
@@ -455,11 +386,13 @@ static void computeGeom(TFT_eSPI& t, int screenH, int& top, int& bodyBottom,
 // row above the one you pressed.
 
 void uiSettingsInit(TFT_eSPI& t) {
-    // Arriving at Settings is arriving at its main page, at the top. Scroll memory is for moving BETWEEN pages inside one
+    // Arriving at Settings is arriving at its main page, at the top, with
+    // nothing folded. Scroll memory is for moving BETWEEN pages inside one
     // visit -- carrying it across a fresh entry would drop you mid-list with
     // no idea why.
     s_page = SettingsPage::MAIN;
-    for (uint8_t i = 0; i < 5; i++) g_scrollFor[i] = 0;
+    for (uint8_t i = 0; i < 4; i++) g_scrollFor[i] = 0;
+    for (uint8_t i = 0; i < 6; i++) s_folded[i] = false;
     // Any pending question dies with the screen. Coming back to Settings and
     // finding a confirm panel still up from last time would be answering
     // something you no longer remember asking.
@@ -844,14 +777,6 @@ static void rowContent(SettingsRow r, const DetectionEngine& eng, char* valBuf, 
         case SettingsRow::AUTO_QUIET:
             label = "AUTO SNOOZE"; value = Settings::autoQuietLabel();
             break;
-#if defined(CROWPANEL7)
-        case SettingsRow::BUZZER:
-            // NEW ONLY rather than ON: the value says what the switch does,
-            // the way AT BOOT and AFTER 5 do, so nobody expects a beep per
-            // alert. The rules are in crowpanel7_buzzer.h.
-            label = "BUZZER"; value = Settings::buzzerOn() ? "NEW ONLY" : "OFF";
-            break;
-#endif
         case SettingsRow::DETECTION_FILTER:
             // "DETECTION FILTER" (the row's own screen title, no width
             // constraint there) overlaps its own "14/14" value in
@@ -873,73 +798,6 @@ static void rowContent(SettingsRow r, const DetectionEngine& eng, char* valBuf, 
             snprintf(valBuf, valBufN, "%u", (unsigned)IgnoreList::count());
             value = valBuf;
             break;
-#if defined(FREENOVE_S3)
-        case SettingsRow::BOARD_BATTERY:
-            label = "BATTERY"; boardBatteryLine(valBuf, valBufN); value = valBuf;
-            break;
-#endif
-#if defined(TWATCH_S3)
-        case SettingsRow::WATCH_BATTERY:
-            label = "BATTERY"; twatchBatteryLine(valBuf, valBufN); value = valBuf;
-            break;
-        case SettingsRow::WATCH_RADIO:
-            label = "RADIOS"; value = Settings::radioDutyName(Settings::radioDutyRaw());
-            break;
-        case SettingsRow::WATCH_LISTEN:
-            label = "BLE LISTEN"; snprintf(valBuf, valBufN, "%u%%", (unsigned)Settings::bleListenRaw()); value = valBuf;
-            break;
-        case SettingsRow::WATCH_IDLE_CPU:
-            label = "SLEEP CPU"; snprintf(valBuf, valBufN, "%u MHz", (unsigned)Settings::idleCpuMhzRaw()); value = valBuf;
-            break;
-        case SettingsRow::WATCH_BUZZ:
-            label = "BUZZ"; value = Settings::buzzModeName();
-            break;
-        case SettingsRow::WATCH_SETTINGS:
-            label = "WATCH SETTINGS"; value = ">";
-            break;
-        case SettingsRow::WATCH_TEMP:
-            label = "CHIP TEMP"; snprintf(valBuf, valBufN, "%d C", twatchChipC()); value = valBuf;
-            break;
-        case SettingsRow::WATCH_WARDRIVE: {
-            // OFF, or what it is doing: finding the GPS, waiting for a fix, or
-            // logging, with how many sightings are kept.
-            label = "WARDRIVE";
-            const uint8_t g = twatchGpsState();
-            if (!Wardrive::enabled())  value = "OFF";
-            else if (g == 4)           value = "GPS RESTING";
-            else if (g <= 1)           value = "GPS STARTING";
-            else if (g == 2)           value = "NO FIX YET";
-            else { snprintf(valBuf, valBufN, "ON  %lu", (unsigned long)Wardrive::count()); value = valBuf; }
-            break;
-        }
-        case SettingsRow::WATCH_QUIET_TAGS:
-            label = "TAGS + RINGS"; value = Settings::quietTrackers() ? "LOG ONLY" : "ALERT";
-            break;
-#if SQUACH_LORA
-        case SettingsRow::WATCH_LORA:
-            label = "LORA"; value = Settings::loraListenName();
-            break;
-        case SettingsRow::WATCH_LORA_CHATS: {
-            label = "LORA CHATS";
-            const uint16_t u = uiLoraChatUnread();
-            if (u) { snprintf(valBuf, valBufN, "%u NEW", (unsigned)u); value = valBuf; }
-            else value = "OPEN";
-            break;
-        }
-#endif
-#endif
-        case SettingsRow::CHARGE_MODE:
-            label = "CHARGE MODE"; value = "START";
-            break;
-        case SettingsRow::LAST_RUN: {
-            // The boot before this one: how long it ran before it stopped.
-            label = "LAST RUN";
-            uint16_t b[2], m[2];
-            const uint8_t n = Settings::runHistory(b, m, 2);
-            if (n < 2) value = "--";
-            else { snprintf(valBuf, valBufN, "%uh %02um", (unsigned)(m[1] / 60), (unsigned)(m[1] % 60)); value = valBuf; }
-            break;
-        }
         case SettingsRow::POWER_SAVER:
             label = "POWER SAVER"; value = Settings::powerSaver() ? "ON" : "OFF";
             break;
@@ -974,10 +832,7 @@ static void rowContent(SettingsRow r, const DetectionEngine& eng, char* valBuf, 
             else value = "NONE >";
             break;
         case SettingsRow::TIME_ZONE:
-            // Two arrows like BRIGHT's minus and plus: the left half of the
-            // row steps west, the right half east, so going one past your
-            // zone is one tap back rather than a lap of the world.
-            label = "ZONE <  >"; value = Settings::timeZoneName();
+            label = "TIME ZONE"; value = Settings::timeZoneName();
             break;
         case SettingsRow::REPLAY_INTRO:
             label = "REPLAY INTRO";
@@ -1034,13 +889,6 @@ static void rowContent(SettingsRow r, const DetectionEngine& eng, char* valBuf, 
             value = bingoVal;
             break;
         }
-        case SettingsRow::DEX: {
-            label = "SQUACHY-DEX";
-            static char dexVal[12];
-            snprintf(dexVal, sizeof dexVal, "%u/%u >", (unsigned)s_dexCaught, (unsigned)Dex::ENTRIES);
-            value = dexVal;
-            break;
-        }
         case SettingsRow::DESK_MODE:
             label = "DESK MODE";
             value = ">";
@@ -1074,7 +922,6 @@ void uiSettingsTick(TFT_eSPI& t, uint32_t now, const DetectionEngine& eng) {
     // uses for the crowd's tap targets.
     s_hasWatch = eng.watchKind() != DetectionEngine::WatchKind::NONE;
     s_hasHunt  = eng.huntKind()  != DetectionEngine::WatchKind::NONE;
-    s_dexCaught = uiDexCaught(eng);
     if (s_hasWatch) { strncpy(s_watchLabel, eng.watchLabel(), sizeof(s_watchLabel) - 1); s_watchLabel[sizeof(s_watchLabel) - 1] = 0; }
     if (s_hasHunt)  { strncpy(s_huntLabel,  eng.huntLabel(),  sizeof(s_huntLabel)  - 1); s_huntLabel[sizeof(s_huntLabel)  - 1] = 0; }
 
@@ -1118,11 +965,10 @@ switch (Settings::background()) {
     if (s_page == SettingsPage::APPEARANCE) pageTitle = ">> APPEARANCE <<";
     else if (s_page == SettingsPage::SYSTEM) pageTitle = ">> SYSTEM <<";
     else if (s_page == SettingsPage::DESK)   pageTitle = ">> DESK MODE <<";
-    else if (s_page == SettingsPage::WATCH)  pageTitle = ">> WATCH SETTINGS <<";
     Theme::drawTitleBar(t, pageTitle);
 
     // +6, not +4: four group headers plus the two tracking rows.
-    DisplayItem items[LIST_MAX_N + 7];
+    DisplayItem items[LIST_MAX_N + 6];
     uint8_t n = buildDisplayList(items);
     // Clamped here rather than in uiSettingsScroll(): row heights come from
     // live font metrics, which that function has no display to ask.
@@ -1173,12 +1019,43 @@ switch (Settings::background()) {
     drawSettingsConfirm(t, w, h);
 }
 
+bool uiSettingsTapHeader(TFT_eSPI& t, int x, int y, int screenW, int screenH) {
+    (void)x; (void)screenW;
+    int top, bodyBottom, rowH, headerH, tallH;
+    computeGeom(t, screenH, top, bodyBottom, rowH, headerH, tallH);
+
+    DisplayItem items[LIST_MAX_N + 6];
+    uint8_t n = buildDisplayList(items);
+    // Same clamp the draw applies, so a tap can never be tested against a
+    // scroll position the screen is not actually showing.
+    { const int m = maxScroll(items, n, top, bodyBottom, rowH, headerH, tallH);
+      if (g_scroll > m) g_scroll = m; }
+
+    int cy = top;
+    int idx = g_scroll;
+    while (idx < n) {
+        int itemH = itemHeight(items[idx], rowH, headerH, tallH);
+        if (cy + itemH > bodyBottom) break;
+        if (y >= cy && y < cy + itemH && items[idx].isHeader) {
+            const uint8_t g = (uint8_t)items[idx].group;
+            s_folded[g] = !s_folded[g];
+            // Folding shortens the list under your finger; an old scroll
+            // offset would leave you staring at blank space below the end.
+            g_scroll = 0;
+            return true;
+        }
+        cy += itemH;
+        idx++;
+    }
+    return false;
+}
+
 SettingsRow uiSettingsHitTest(TFT_eSPI& t, int x, int y, int screenW, int screenH) {
     (void)x; (void)screenW;
     int top, bodyBottom, rowH, headerH, tallH;
     computeGeom(t, screenH, top, bodyBottom, rowH, headerH, tallH);
 
-    DisplayItem items[LIST_MAX_N + 7];
+    DisplayItem items[LIST_MAX_N + 6];
     uint8_t n = buildDisplayList(items);
     // Same clamp the draw applies, so a tap can never be tested against a
     // scroll position the screen is not actually showing.

@@ -38,17 +38,6 @@ namespace Squachy {
     // conf is the matched SIGNATURE's grade, not the type's -- he reads a
     // percentage out loud, so quoting the type's would misstate exactly the
     // hits the per-entry split exists to be honest about.
-    // What main.cpp knows about a catch that the engine's numbers do not:
-    // set right before a DETECTION trigger, spent by it. `regular` is the
-    // device's neighbour-name or null; `newRegular` that it just earned one;
-    // `nemesis` that the type is his most-caught; `newClosest` that it came
-    // closer than any of its kind before.
-    void catchContext(const char* regular, bool newRegular, bool nemesis, bool newClosest);
-    // Somewhere to get an idle line from that knows more than he does --
-    // see notices.h. Called from the idle roll a third of the time; null
-    // means "nothing this time" and the usual pools carry on.
-    typedef const char* (*IdleProvider)();
-    void setIdleProvider(IdleProvider fn);
     void trigger(Event evt, DetectionType dt = DetectionType::UNKNOWN,
                  uint32_t lifetimeTotal = 0, uint32_t hitCount = 1,
                  int8_t rssi = 0,
@@ -78,12 +67,6 @@ namespace Squachy {
     // through to any other touch handling on the CLEAR screen, so a
     // tap on him pets him instead of doing nothing.
     bool hitTest(int x, int y);
-    // Where a tap landed on him, before PETTED: his head, his belly or his
-    // feet each get their own reaction. Zone 0 is "not on him".
-    void noteTapAt(int x, int y);
-    // A fast swipe across him: he slides into the wall on that side, wobbles,
-    // and walks back. dir is +1 for right, -1 for left.
-    void flick(int8_t dir);
 
     // Where he was drawn last frame, and how wide, so a background can
     // react to him standing in it. Returns false before he has ever been
@@ -271,12 +254,6 @@ namespace Squachy {
     // the two previews above. Nobody but a cameo wears one; our own
     // Squachy knows who he is.
     void setNameTag(const char* name);
-
-    // A radio headset on his head -- band, ear cups and a mic -- for the
-    // watch alert's LOCKED ON screen. Drawn as part of his head, so it bobs,
-    // talks and scales with him. Same contract as the name tag: set it, draw,
-    // clear it.
-    void setHeadset(bool on);
 
     // A line from outside his own head, said once: the update notice. The
     // text must outlive the bubble -- a static buffer, not a stack one.

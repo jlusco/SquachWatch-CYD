@@ -15,6 +15,85 @@ are collected in [Measure first](#10-measure-first), and the ones a bench
 session on 2026-09-26 answered are marked there as answered, with the reading
 that answered them.
 
+Everything after the next two sections is about the CrowPanel. The T-Watch
+S3 and S3 Plus use the same radio driver and decoders in a much smaller
+package, and so does the LilyGo T-Deck Plus, which can also send; those are
+the next two sections.
+
+## On the T-Watch S3 and S3 Plus
+
+Since v1.26.0 both watches listen to LoRa as well as WiFi and Bluetooth.
+**Receive only:** the watch never transmits.
+
+- **What it hears:** Meshtastic and MeshCore, the two community mesh
+  networks. Public traffic reads in full: Meshtastic's default LongFast
+  channel, and MeshCore's Public and hashtag channels. Private channels and
+  direct messages stay unread, because the watch does not have their keys.
+- **Which frequencies:** one Meshtastic preset (LongFast) and one MeshCore
+  preset per band. **EU 868** listens on 869.525 MHz (Meshtastic) and
+  869.618 MHz (MeshCore); **US 915** on 906.875 MHz (Meshtastic) and
+  910.525 MHz (MeshCore). With both networks on, it takes turns between the
+  two.
+- **Which band:** picked from the time zone at boot: 915 for the US zones
+  (Alaska and Hawaii included) and the rest of the Americas, 868 everywhere
+  else. `LORA REGION AUTO|EU|US` on the console
+  overrides it; the change takes effect at the next restart.
+- **Where it shows:** a pink **LORA *n* NEW** pill at the top of the main
+  screen (tap it), and one buzz per new message, at most one every 30
+  seconds. **LORA CHATS** has one tab per network, with who sent each
+  message and on which channel. Privacy Mode covers the chats too.
+- **Settings:** WATCH SETTINGS > **LORA** cycles BOTH (the default),
+  MESHTASTIC, MESHCORE and OFF. WATCH SETTINGS > **LORA CHATS** opens the
+  chats and shows how many are new.
+- **Console:** `LORA` for the status, `LORA NODES`, `LORA MSGS`, and
+  `LORA REGION`.
+
+The radio driver and every decoder came from DH5DAX's CrowPanel work. On the
+bench it caught 26 of 26 test messages across both networks.
+
+## On the LilyGo T-Deck Plus
+
+Since v1.37.0 the T-Deck listens the way the watches do, and because it has
+a keyboard, it can also **send**.
+
+- **Listening:** the same networks, presets, band choice, pill and **LORA
+  CHATS** as the watches. Settings > SYSTEM > **LORA** cycles BOTH,
+  MESHTASTIC, MESHCORE and OFF.
+- **The LORA page** (since v1.39.0): press **Enter** on the main screen, or
+  tap the LORA pill, which stays up whenever the radio is on. A radar of the
+  nodes heard: one that has sent its position sits at its real bearing and
+  distance once the T-Deck has a GPS fix, the rest wait on the dotted rim,
+  because one antenna cannot tell direction. A filled dot was heard directly,
+  a hollow one only through relays, and signal strength is never drawn as
+  distance. Beside it, NOW, FLOOR, PEAK and MARGIN, and a strip of the last
+  80 seconds: the noise as a line, each packet as a spike in its network's
+  colour. Under the radar, the GPS (FIX *n* SATS, SEARCHING or NOT HEARD) and
+  the nearest node. Below, one chat window with a MESHTASTIC tab and a
+  MESHCORE tab, and a compose line that sends to the open tab (LORA TX
+  permitting). BACK is in the top-right corner.
+- **One row per message.** A message relayed by three nodes used to show up
+  three times, and your own send could come back as a second row. Since
+  v1.39.0 a repeat of the same message within ten minutes is dropped.
+- **BOTH works on both.** The T-Deck stays tuned to MeshCore, whose
+  messages announce themselves for only 65 ms, and glances at Meshtastic
+  every 33 ms or so; a glance takes about 32 ms, well inside Meshtastic's
+  160 ms announcement. On the bench it caught 24 of 25 MeshCore and 25 of
+  25 Meshtastic messages with both on. (v1.37.0 took turns and caught only
+  about one MeshCore message in four.)
+- **Sending:** Settings > SYSTEM > **LORA TX** is OFF until you change it,
+  then 10 dBm or 20 dBm (14 dBm at most in the EU band). In LORA CHATS, type
+  on the keyboard and press Enter: the text goes out on the open tab's
+  network. Meshtastic: the public LongFast channel under its published key,
+  from a node number made from the board's own address. MeshCore: the Public
+  channel, as *your squad nickname*: *your text* (SQUACHY when no nickname is
+  set). Your message appears in the list as YOU.
+- **What sending means:** these are public channels. Anyone nearby with a
+  Meshtastic or MeshCore radio reads what you send, and anyone can claim any
+  name on them, you included.
+- **Why the screen does not mind:** the radio shares the screen's wires. Its
+  bytes go out between frames through the screen's own SPI path, with only
+  the speed changed for its turn (src/lora_radio.cpp, the T-Deck branch).
+
 ## What is built
 
 The research below became code on 2026-09-26, in the `crowpanel7` build

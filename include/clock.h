@@ -50,10 +50,6 @@ uint32_t nowEpoch();
 // Sets the clock. Rejects anything before 2025, which is what an unset
 // ESP32 reports and what a mistyped command usually looks like.
 bool setEpoch(uint32_t epoch);
-// Called after every accepted setEpoch(), with the new time. The T-Watch
-// hands it to its battery-backed clock chip so the time survives a flat
-// battery; nothing else registers one.
-void onSet(void (*fn)(uint32_t epoch));
 
 uint32_t uptimeSec();
 
@@ -90,7 +86,6 @@ void formatTime(char* out, size_t n, bool twelveHour, bool* pm = nullptr);
 // ---- the zone ---------------------------------------------------------
 uint8_t     zoneCount();
 const char* zoneName(uint8_t i);
-uint8_t     zoneStep(uint8_t i, int dir);   // the zone before (-1) or after (+1) i, west to east
 void        applyZone(uint8_t i);   // Settings calls this at boot and on change
 
 // ---- network time -----------------------------------------------------

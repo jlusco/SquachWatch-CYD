@@ -72,19 +72,9 @@ otherwise see all week. It is one tap away in `DETECTION FILTER`.
 - **ESP32-2432S028R** ("Cheap Yellow Display" / CYD) — about $15.
   Built-in 320×240 ILI9341 TFT, XPT2046 resistive touch, and an
   onboard microSD card slot.
-- **Elecrow CrowPanel Advance 7.0** — experimental: an ESP32-S3 with an
-  800×480 RGB panel and GT911 touch, via the `crowpanel7` build. It renders
-  at 400×240 doubled, on purpose. See [board setup and testing](docs/CROWPANEL7.md).
 
-That's it. No GPS, no extra modules. The CYD is the whole device, and the
-one board that happens to carry a buzzer keeps it silent unless you switch
-it on.
-
-Other boards have builds of their own -- `platformio.ini` has one
-`[env:...]` each, with what is and is not confirmed on it. The newest is the
-**Freenove ESP32-S3 Display 2.8"** (FNK0104B, `[env:freenove-s3]`): an S3
-with capacitive touch, an SDMMC card slot, a WS2812 status light and a
-battery connector. Pins in [docs/PINOUT.md](docs/PINOUT.md).
+That's it. No buzzer, no GPS, no extra modules. The CYD is the
+whole device.
 
 ## Web Flash
 
@@ -94,10 +84,7 @@ from your browser:
 **[https://squachwatch.com/](https://squachwatch.com/)**
 
 Works in Firefox, Chrome, Edge, or Brave on desktop. Pick your board (2.8" CYD,
-AWOK 2.4", RL Phantom 2.4", Freenove 3.2", or in beta the 3.5", the LilyGo
-T-Watch S3, the Freenove ESP32-S3 2.8" and the Elecrow CrowPanel 7"), plug in,
-click Connect & Install, done. A T-Watch has its clock set for it once the install
-finishes.
+AWOK 2.4" or RL Phantom 2.4"), plug in, click Connect & Install, done.
 
 ## Build
 
@@ -113,8 +100,6 @@ Three steps:
    ```sh
    pio run -t upload
    ```
-   For a board that is not the default three, name its build, e.g.
-   `pio run -e freenove-s3 -t upload`.
 
 The first build pulls the TFT_eSPI, XPT2046, and NimBLE-Arduino
 libraries; after that it's incremental.
@@ -202,8 +187,7 @@ The power saver never dims this screen.
 
 ## The status light
 
-The RGB LED on the back of the 2.8" CYD (on the front of the RL Phantom, and
-a WS2812 on the Freenove ESP32-S3 2.8")
+The RGB LED on the back of the 2.8" CYD (on the front of the RL Phantom)
 tells you what the screen is doing without the screen. A slow breathe in the
 theme's colour when nothing is happening; three flashes and a hold in the
 detection's own colour when something is, for as long as the alert card is
@@ -214,7 +198,7 @@ other restart from the back too.
 
 **Settings → APPEARANCE → STATUS LIGHT**: the master switch, alerts and
 messages on or off, idle breathe or solid or off, an idle colour that follows
-the theme, the background, or one of nine fixed colours, brightness in seven
+the theme, the background, or one of nine fixed colours, brightness in five
 steps, and a TEST row that plays the lot in six seconds. Boards whose LED pins
 have not been checked (the AWOK and the 3.5") compile it out and say so on
 that screen.

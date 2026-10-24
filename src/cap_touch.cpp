@@ -1,27 +1,80 @@
-// SquachWatch-CYD — capacitive touch (CST816/CST820) driver
+// SquachWatch-CYD - capacitive touch driver abstraction.
+// LCDWiki ES3C28P: FocalTech FT6336G, I2C address 0x38.
+// Existing RL Phantom path: CST816/CST820, I2C address 0x15.
 #include "cap_touch.h"
+#include <Arduino.h>
 #include <Wire.h>
 
 namespace CapTouch {
 
-// Standard Hynitron CST816-family register map (same layout used
-// across the common open-source drivers for this chip family):
-//   0x02: finger count (0 = up, 1 = down — single-touch chip)
-//   0x03: X high byte (low nibble = X[11:8])
-//   0x04: X low byte
-//   0x05: Y high byte (low nibble = Y[11:8])
-//   0x06: Y low byte
-static uint8_t ADDR = 0x15;
+#if defined(LCDWIKI_ES3C28P)
+static constexpr uint8_t ADDR = 0x38;
+static constexpr uint8_t REG_STATUS = 0x02;
+static constexpr uint8_t REG_TOUCH1 = 0x03;
 
-void begin(int sda, int scl, int rst, uint8_t addr) {
-    ADDR = addr;
-    if (rst >= 0) {
-        pinMode(rst, OUTPUT);
-        digitalWrite(rst, LOW);
-        delay(10);
-        digitalWrite(rst, HIGH);
-        delay(50);  // chip boot time after reset release
+static int sdaPin = -1;
+static int sclPin = -1;
+static int rstPin = -1;
+
+static bool readBytes(uint8_t reg, uint8_t* data, size_t len) {
+    Wire.beginTransmission(ADDR);
+    Wire.write(reg);
+    if (Wire.endTransmission(false) != 0) return false;
+    size_t got = Wire.requestFrom((uint8_t)ADDR, (uint8_t)len);
+    if (got != len) return false;
+    for (size_t i = 0; i < len; ++i) data[i] = Wire.read();
+    return true;
+}
+
+void begin(int sda, int scl, int rst) {
+    sdaPin = sda;
+    sclPin = scl;
+    rstPin = rst;
+
+    if (rstPin >= 0) {
+        pinMode(rstPin, OUTPUT);
+        digitalWrite(rstPin, HIGH);
+        delay(20);
+        digitalWrite(rstPin, LOW);
+        delay(20);
+        digitalWrite(rstPin, HIGH);
+        delay(500); // Matches LCDWiki's supplied FT6336 driver.
     }
+
+    Wire.begin(sdaPin, sclPin);
+    Wire.setClock(400000);
+}
+
+bool probe() {
+    Wire.beginTransmission(ADDR);
+    return Wire.endTransmission() == 0;
+}
+
+bool read(uint16_t& x, uint16_t& y) {
+    uint8_t status = 0;
+    if (!readBytes(REG_STATUS, &status, 1)) return false;
+    const uint8_t touches = status & 0x0F;
+    if (touches == 0 || touches > 2) return false;
+
+    uint8_t data[4] = {};
+    if (!readBytes(REG_TOUCH1, data, sizeof(data))) return false;
+
+    x = (uint16_t)(((data[0] & 0x0F) << 8) | data[1]);
+    y = (uint16_t)(((data[2] & 0x0F) << 8) | data[3]);
+    return true;
+}
+
+#else
+
+// Existing CST816/CST820 implementation used by the RL Phantom capacitive path.
+static const uint8_t ADDR = 0x15;
+
+void begin(int sda, int scl, int rst) {
+    pinMode(rst, OUTPUT);
+    digitalWrite(rst, LOW);
+    delay(10);
+    digitalWrite(rst, HIGH);
+    delay(50);
     Wire.begin(sda, scl);
 }
 
@@ -48,4 +101,6 @@ bool read(uint16_t& x, uint16_t& y) {
     return true;
 }
 
-}  // namespace CapTouch
+#endif
+
+} // namespace CapTouch

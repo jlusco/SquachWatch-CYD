@@ -285,12 +285,6 @@ static int lockIconX(int w) {
     return rotateShown() ? (w - ROTATE_ICON_W - LOCK_ICON_W) : (w - LOCK_ICON_W);
 }
 
-int titleBarRightIconsX(int w) {
-    if (Security::enabled()) return lockIconX(w);
-    if (rotateShown()) return w - ROTATE_ICON_W;
-    return w;
-}
-
 static void drawLockIcon(TFT_eSPI& t, int w, int barH) {
     const int x0 = lockIconX(w);
     t.fillRect(x0, 0, LOCK_ICON_W, barH, BG);
@@ -363,6 +357,26 @@ void bubbleFontOff(TFT_eSPI& t) { t.setTextFont(1); }
 int  bubbleTextH()  { bubbleMeasure(); return s_bubAb + s_bubBb; }
 int  bubbleAscent() { bubbleMeasure(); return s_bubAb; }
 #endif
+
+static bool s_bodyLarge = false;
+static bool s_bodyCompact = false;
+
+int listHeadingH() { return LIST_HEADING_H; }
+bool large() { return s_bodyLarge; }
+bool compact() { return s_bodyCompact; }
+
+void bodyFontOn(TFT_eSPI& t) {
+    t.setTextFont(1);
+    t.setTextSize(1);
+    s_bodyLarge = (t.width() >= 320 && t.height() >= 220);
+    s_bodyCompact = (t.width() <= 240 && t.height() <= 160);
+}
+
+void bodyFontOff(TFT_eSPI& t) {
+    (void)t;
+    s_bodyLarge = false;
+    s_bodyCompact = false;
+}
 
 void drawListHeading(TFT_eSPI& t, const char* text, uint16_t color) {
     t.setTextSize(1);

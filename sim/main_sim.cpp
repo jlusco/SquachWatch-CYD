@@ -37,9 +37,6 @@
 #include "qwerty.h"
 #include "ui_meshmenu.h"
 #include "ui_bingo.h"
-#include "ui_dex.h"
-#include "dex.h"
-#include "regulars.h"
 #include "bingo.h"
 #include "blackbox.h"
 #include "ui_meshwarn.h"
@@ -49,7 +46,6 @@
 #include "meshmsg.h"
 #include "meshcrypto.h"
 #include "ui_watchalert.h"
-#include "ignore_list.h"
 #include "ui_colorcheck.h"
 #include "ui_diagnostics.h"
 #include "ui_desk.h"
@@ -114,9 +110,6 @@ static void seedDetections(DetectionEngine& eng) {
         d.active    = (i >= 4) ? false : true;
         d.prevRssi  = (int8_t)(d.rssi - (i % 3 == 0 ? 7 : (i % 3 == 1 ? -8 : 1)));
         eng.postBle(d);
-        // The Ring is a regular: seen on three days, so the LOG names it.
-        if (seeds[i].type == DetectionType::RING)
-            for (uint32_t day = 20000; day < 20003; day++) Regulars::noteOnDay(d.mac, d.type, day);
     }
 
     // Give the drone an actual Remote ID broadcast to have decoded.
@@ -274,8 +267,7 @@ static int renderTouchCal(TFT_eSPI& tft, int W, int H, int skip, int want,
 static void usage() {
     fprintf(stderr,
         "usage: squachsim <screen> [out.png] [options]\n"
-        "  screens: clear log alert settings detfilter power diary hunt rawscan watchalert colorcheck boot phone meshmenu meshwarn bingo dex touchcal icons\n"
-        "  dex               --pose N opens entry N\'s card (1-17); 0 is the index\n"
+        "  screens: clear log alert settings detfilter power diary hunt rawscan watchalert colorcheck boot phone meshmenu meshwarn bingo touchcal\n"
         "  touchcal          the touch calibration, played by a scripted finger:\n"
         "                    --frames skips that many 66 ms frames, --sequence films\n"
         "  --portrait        render 240x320 instead of 320x240\n"
@@ -430,7 +422,6 @@ int main(int argc, char** argv) {
 
     Settings::load();
     Clock::begin();
-    Regulars::begin();
     // Settings' own cycle* mutators are the only public way in, so walk
     // them to the requested index rather than reaching past the API.
     if (themeIdx >= 0) while ((int)Settings::paletteIndex() != themeIdx % (int)Theme::PALETTE_COUNT) Settings::cyclePalette();
@@ -543,9 +534,6 @@ int main(int argc, char** argv) {
     // The desk's HOW MANY follows --crowd, the way the main screen's does.
     for (int g = 0; g < 10 && Settings::deskCrowd() != Settings::meshCrowd(); g++) Settings::cycleDeskCrowd();
     if (getenv("SQUACHSIM_FULLVISIT") && !Settings::deskFullVisit()) Settings::toggleDeskFullVisit();
-    // SQUACHSIM_LTBRIGHT=N: the STATUS LIGHT's BRIGHTNESS step, 1..7.
-    if (const char* lb = getenv("SQUACHSIM_LTBRIGHT"))
-        for (int g = 0; g < 8 && Settings::lightBrightness() != atoi(lb); g++) Settings::cycleLightBrightness();
     // SQUACHSIM_CLOCK="font,size,backdrop", e.g. "1,2,3" for large Bangers over toasters.
     if (const char* ck = getenv("SQUACHSIM_CLOCK")) {
         int f = 0, z = 1, b = 0;
@@ -604,7 +592,7 @@ int main(int argc, char** argv) {
             uiLogTick(frame, t, engine, 0, false, "", info,
                       info ? detectionTypeName(it) : nullptr,
                       info ? DetectionInfo::explainLive(it, engine) : "",
-                      false, false, false);   // no confirm panel in the sim: nothing watched, nothing hunted
+                      false, false);   // no confirm panel in the sim: nothing watched, nothing hunted
         }
         else if (screen == "alert")    uiAlertTick(frame, t, engine, false, nullptr, "");
         else if (screen == "settings") uiSettingsTick(frame, t, engine);
@@ -617,10 +605,9 @@ int main(int argc, char** argv) {
         else if (screen == "desk")     uiDeskTick(frame, t, engine);
         else if (screen == "zonecard") { uiClearTick(frame, t, engine, true, false); uiZoneCardDraw(frame, t); }
         else if (screen == "hunt")     uiHuntTick(frame, t, engine);
-        else if (screen == "rawscan")  uiRawScanTick(frame, t, engine, true, true, false, "", false, false, false);
+        else if (screen == "rawscan")  uiRawScanTick(frame, t, engine, true, true, false, "", false, false);
         else if (screen == "phone")    uiPhoneTick(frame, t, engine);
         else if (screen == "bingo")    uiBingoTick(frame, t, engine);
-        else if (screen == "dex")      uiDexTick(frame, t, engine);
         else if (screen == "meshmenu") uiMeshMenuTick(frame, t, engine);
         else if (screen == "roster")   uiSquadTick(frame, t, engine);
         else if (screen == "meshwarn") uiMeshWarnTick(frame, t, engine);
@@ -628,18 +615,6 @@ int main(int argc, char** argv) {
         else if (screen == "compose")  uiMeshComposeTick(frame, t, engine);
         else if (screen == "watchalert") uiWatchAlertTick(frame, t, engine, true);
         else if (screen == "colorcheck") uiColorCheckTick(frame, t);
-        else if (screen == "icons") {
-            // Every detection type's icon, large, on a black ground: an icon
-            // sheet for mockups and docs. 6 across; --size sets the cell.
-            frame.fillRect(0, 0, frame.width(), frame.height(), 0x0000);
-            const int cols = 6, cw = frame.width() / cols, ch = frame.height() / 3;
-            // A third, not a half: several icons draw wider than 2s.
-            const int s = (cw < ch ? cw : ch) / 3;
-            for (int i = 1; i < (int)DetectionType::COUNT; i++) {
-                const int k = i - 1;
-                Theme::drawTypeIcon(frame, (DetectionType)i, (k % cols) * cw + cw / 2, (k / cols) * ch + ch / 2, s);
-            }
-        }
         else if (screen == "diagnostics") {
             // main.cpp fills this from board-specific globals the sim
             // has no equivalent for, so these are plausible stand-ins.
@@ -725,18 +700,8 @@ int main(int argc, char** argv) {
     };
 
     // Per-screen init, where the screen has one.
-    if      (screen == "clear" || screen == "zonecard") {
-        uiClearInit(frame);
-        // SQUACHSIM_ZONE=<index into Clock's table> shows the zone card on
-        // that zone, for rendering one of them.
-        if (const char* z = getenv("SQUACHSIM_ZONE")) Settings::setTimeZone((uint8_t)atoi(z));
-    }
+    if      (screen == "clear" || screen == "zonecard") uiClearInit(frame);
     else if (screen == "log") {
-        // The second row ignored, so the screen shows its IGNORED tag. The
-        // sim's NVS is in memory unless SQUACHSIM_NVS says otherwise, so
-        // this does not follow any other render around.
-        IgnoreList::begin();
-        if (const Detection* d = engine.logAt(1)) IgnoreList::add(d->mac, d->type);
         // Three sightings in the black box, so the list shows the rows held
         // in RAM and then carries on into the ones kept in flash.
         BlackBox::begin();
@@ -767,19 +732,9 @@ int main(int argc, char** argv) {
         if (getenv("SQUACH_ALERT") && engine.logAt(0)) uiDeskAlert(*engine.logAt(0), now);
     }
     else if (screen == "rawscan")    uiRawScanInit(frame, true);
-    else if (screen == "watchalert") {
-        // Watching the seeded AirTag, with a signal that has been climbing for
-        // the last twenty seconds -- so the screen has a name, a type and a
-        // trend to show.
-        const uint8_t tile[6] = { 0x10, 0x11, 0x12, 0x13, 0x14, 0x15 };
-        engine.watchBle(tile, "AirTag");
-        static const int8_t R[] = { -89, -86, -87, -83, -80, -81, -76, -73, -70, -67, -64, -61 };
-        for (int8_t r : R) engine.checkWatchBle(tile, r);
-        uiWatchAlertInit(frame);
-    }
+    else if (screen == "watchalert") uiWatchAlertInit(frame);
     else if (screen == "diagnostics") uiDiagnosticsInit(frame);
     else if (screen == "colorcheck") uiColorCheckInit(frame);
-    else if (screen == "icons")      {}
     else if (screen == "boot")       uiBootInit(frame);
     else if (screen == "update")     uiUpdateInit(frame);
     else if (screen == "nudge")      { const uint8_t v[3] = { 1, 7, 6 }; uiNudgeInit(frame, "BIGFOOT", v, 30, 0); }
@@ -801,13 +756,14 @@ int main(int argc, char** argv) {
         // The real path: a version arrives, then the release's own lines if
         // it came from the site. --from makes it a squad member's hello,
         // which carries a number and no notes.
-        OtaCore::noteAvailable("1.24.1", heardFrom.c_str());
+        OtaCore::noteAvailable("1.11.0", heardFrom.c_str());
         if (heardFrom.empty()) {
-            static const char* const NEWS[2] = {
-                "No more phantom Flock alerts",
-                "Nameless gadgets stay nameless",
+            static const char* const NEWS[3] = {
+                "The update window you are reading",
+                "Squad updates check WiFi is nearby",
+                "Desk mode remembers the timer",
             };
-            OtaCore::noteRelease("Ghost Town", NEWS, 2);
+            OtaCore::noteRelease("Bramble", NEWS, 3);
         }
         uiSysPropsInit(frame);
         // The tab a tap would have opened, for rendering one of them.
@@ -823,34 +779,6 @@ int main(int argc, char** argv) {
     }
     else if (screen == "wifinets")   uiWifiNetsInit(frame);
     else if (screen == "wifiadd")    uiWifiAddInit(frame);
-    else if (screen == "dex") {
-        // Eleven of the seventeen caught, through the engine's own door, with
-        // a record for each so the cards have something to say. --pose N
-        // opens straight on entry N (1-based); --pose 0 shows the index.
-        Dex::begin();
-        static const DetectionType got[] = {
-            DetectionType::FLOCK, DetectionType::AXON, DetectionType::META, DetectionType::AIRTAG,
-            DetectionType::DRONE, DetectionType::ALPR, DetectionType::CAMERA, DetectionType::SAMSUNG_TAG,
-            DetectionType::TILE, DetectionType::RING, DetectionType::IBEACON };
-        uint16_t serial = 900;
-        for (DetectionType ty : got) {
-            const int n = ty == DetectionType::AIRTAG ? 38 : ty == DetectionType::AXON ? 2 : 5;
-            for (int k = 0; k < n; k++) {
-                Detection d{};
-                d.mac[0] = 0x02; d.mac[4] = (uint8_t)k; d.mac[5] = (uint8_t)serial++;
-                d.type = ty;
-                d.conf = confidenceFor(ty);
-                d.rssi = (int8_t)(-70 + (k % 30));
-                d.firstSeen = d.lastSeen = now;
-                d.hits = 1;
-                d.active = true;
-                engine.postBle(d);
-                Dex::note(ty, d.rssi);
-            }
-        }
-        uiDexInit(frame);
-        if (poseIdx > 0) uiDexOpenCard((uint8_t)(poseIdx - 1));
-    }
     else if (screen == "bingo") {
         // A card part-way through, so the marked, the lined and the
         // still-missing all show at once.

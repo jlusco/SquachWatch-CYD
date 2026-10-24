@@ -18,7 +18,6 @@
 namespace Theme { void applyPalette(uint8_t) {} }
 namespace Clock {
 uint8_t     zoneCount()        { return 1; }
-uint8_t     zoneStep(uint8_t, int) { return 0; }
 const char* zoneName(uint8_t)  { return "UTC"; }
 void        applyZone(uint8_t) {}
 }

@@ -44,7 +44,6 @@ enum class SettingsRow : uint8_t {
     BANTER,          // on the APPEARANCE page: how much he talks when nothing is happening
     TIME_ZONE,       // on the DESK MODE page: which zone the real clock shows
     BINGO,           // opens the bingo card
-    DEX,             // opens the SQUACHY-DEX
     DESK_MODE,       // opens the DESK MODE page
     DESK_OPEN,       // on the DESK MODE page: go to the desk
     DESK_BACKGROUND, // on the DESK MODE page: the desk's own scene
@@ -54,23 +53,6 @@ enum class SettingsRow : uint8_t {
     CLOCK_FONT,      // on the DESK MODE page: segments or Bangers
     CLOCK_SIZE,      // on the DESK MODE page: small, medium, large
     CLOCK_BACKDROP,  // on the DESK MODE page: what plays inside the clock
-    WATCH_BATTERY,   // the T-Watch only: charge and voltage, under WATCH
-    WATCH_RADIO,     // the T-Watch only: the radio duty cycle, under WATCH
-    WATCH_LISTEN,    // the T-Watch only: BLE LISTEN, how much of the time the receiver is open
-    WATCH_IDLE_CPU,  // the T-Watch only: SLEEP CPU, the clock while the screen is asleep
-    WATCH_BUZZ,      // the T-Watch only: buzz on an alert, OFF / HIGH / MED / LOW
-    WATCH_SETTINGS,  // the T-Watch only: the row on the main list that opens the WATCH SETTINGS page
-    WATCH_TEMP,      // the T-Watch only: the chip's temperature, a reading, under WATCH
-    WATCH_WARDRIVE,  // the T-Watch only: WARDRIVE, every network and device with where, for WiGLE
-    WATCH_QUIET_TAGS, // the T-Watch only: TAGS + RINGS, logged without waking the watch
-    WATCH_LORA,      // the T-Watch only: LORA, which networks the LoRa radio listens to
-    WATCH_LORA_CHATS, // the T-Watch only: LORA CHATS, what it decoded, one chat per network
-#if defined(CROWPANEL7)
-    BUZZER,          // the CrowPanel 7 only, the one board with a buzzer: OFF, or NEW ONLY
-#endif
-    BOARD_BATTERY,   // the Freenove S3 only: the cell's voltage, on the SYSTEM page
-    CHARGE_MODE,     // the CYD boards: radios and screen off so a battery charges faster
-    LAST_RUN,        // the CYD boards: how long the previous boot ran, on the SYSTEM page
     BACK,
     COUNT,
     NONE = 255
@@ -87,13 +69,18 @@ void uiSettingsScroll(int delta);     // positive = scroll down
 // Each page keeps its OWN scroll position, so leaving a page and coming back
 // puts you where you were instead of at the top -- the list is long enough
 // that losing your place was the most-felt annoyance on this screen.
-enum class SettingsPage : uint8_t { MAIN = 0, APPEARANCE = 1, SYSTEM = 2, DESK = 3, WATCH = 4 };
+enum class SettingsPage : uint8_t { MAIN = 0, APPEARANCE = 1, SYSTEM = 2, DESK = 3 };
 void         uiSettingsOpenPage(SettingsPage p);
 SettingsPage uiSettingsCurrentPage();
 
 // Kept so existing callers read the same. APPEARANCE only.
 void uiSettingsOpenAppearance(bool open);
 
+// A tap on a group heading folds that group away, turning a list that runs
+// four screens deep into a short menu. Returns true if (x,y) hit a heading and
+// the fold was toggled, in which case the tap is spent -- call this BEFORE
+// uiSettingsHitTest().
+bool uiSettingsTapHeader(TFT_eSPI& t, int x, int y, int screenW, int screenH);
 
 // True when a mode has switched this row off (boring mode, today). A tap on
 // one says why rather than silently doing nothing.

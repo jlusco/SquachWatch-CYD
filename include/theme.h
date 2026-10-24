@@ -119,10 +119,6 @@ namespace Theme {
     // button in the top-left corner, and the rotate button in the
     // top-right corner (unless hidden, see setRotateIconVisible()).
     void drawTitleBar(TFT_eSPI& t, const char* title);
-    // Where the title bar's right-hand icons begin: the rotate button
-    // and the padlock, whichever are showing right now. The screen width
-    // when neither is. The watch's corner clock stands just left of it.
-    int  titleBarRightIconsX(int w);
 
     // The chrome every list screen BELOW Settings shares, so they read as
     // one family with it: a small heading at the top in the colour of the
@@ -144,6 +140,11 @@ namespace Theme {
     // Takes a width rather than a display because two of its callers are hit
     // tests that are handed a screen size and nothing else.
     int pinnedBackH(int panelW);
+    int listHeadingH();
+    bool large();
+    bool compact();
+    void bodyFontOn(TFT_eSPI& t);
+    void bodyFontOff(TFT_eSPI& t);
     void drawListHeading(TFT_eSPI& t, const char* text, uint16_t color);
 
     // The face speech bubbles are set in. Chosen at compile time by

@@ -55,9 +55,6 @@ uint32_t advertsSeen()          { return 0; }
 static const volatile uint32_t s_kinds0[5] = { 0, 0, 0, 0, 0 };
 const volatile uint32_t* advertKinds() { return s_kinds0; }
 void     setScanWindow(uint8_t) {}
-void     setScanWindowBase(uint8_t) {}
-void     setScanBoost(bool) {}
-void     setScanInterval(uint16_t, uint8_t) {}
 void     setScanPin(uint8_t)    {}
 
 void DetectionEngine::clearLog() {
@@ -83,18 +80,14 @@ void DetectionEngine::resetLifetime() {
 void DetectionEngine::pushLog(const Detection& d) {
     _log[_logHead] = d;
     _latest = &_log[_logHead];
-    _latestNew = true;   // the stand-in only ever pushes; nothing here reactivates
     _logHead = (uint8_t)((_logHead + 1) % LOG_CAP);
     if (_logCount < LOG_CAP) _logCount++;
-    if ((uint8_t)d.type < (uint8_t)DetectionType::COUNT) {
-        _typeCounts[(uint8_t)d.type]++;
-        _lifetimeByType[(uint8_t)d.type]++;   // the DEX and the outfits read this
-    }
+    if ((uint8_t)d.type < (uint8_t)DetectionType::COUNT) _typeCounts[(uint8_t)d.type]++;
     _lifetimeTotal++;
 }
 
 // Radio-fed entry points: inert here, nothing calls them in the sim.
-void DetectionEngine::postWiFi(const uint8_t*, int8_t, uint8_t, const char*, bool, bool, bool) {}
+void DetectionEngine::postWiFi(const uint8_t*, int8_t, uint8_t, const char*, bool, bool) {}
 void DetectionEngine::postDeauth(const uint8_t*, int8_t, uint8_t) {}
 void DetectionEngine::postBle(Detection d) { pushLog(d); }
 
@@ -155,11 +148,7 @@ int8_t DetectionEngine::watchRssiAt(uint8_t idx) const {
     return _watchRssiHist[slot];
 }
 bool DetectionEngine::watchHitPending() { bool f = _watchHitFlag; _watchHitFlag = false; return f; }
-// Records the signal when the address is the watched one, as the firmware
-// does, so the emulator's watch alert has a trend to draw.
-void DetectionEngine::checkWatchBle(const uint8_t* mac, int8_t rssi) {
-    if (mac && isWatched(mac, true)) recordWatchRssi(rssi);
-}
+void DetectionEngine::checkWatchBle(const uint8_t*, int8_t) {}
 void DetectionEngine::checkWatchWifi(const uint8_t*, int8_t) {}
 void DetectionEngine::recordWatchRssi(int8_t rssi) {
     _watchRssiHist[_watchRssiHead] = rssi;

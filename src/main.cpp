@@ -3,27 +3,9 @@
 // and the DetectionEngine.
 
 #include <Arduino.h>
-#include "serial_flush.h"
 #include <SPI.h>
 #include <Wire.h>
 #include <TFT_eSPI.h>
-#if defined(CROWPANEL7)
-#include "crowpanel7_board.h"
-#include "crowpanel7_display.h"
-#include "crowpanel7_rgb.h"
-#include "crowpanel7_blit.h"
-#include "crowpanel7_backlight.h"
-#include "gt911_touch.h"
-#include "crowpanel7_probe.h"
-#include "crowpanel7_buzzer.h"
-// The [frame] line's "rows" is whoever actually wrote them.
-#define SQW_PUSH_ROWS() CrowBlit::lastRows()
-#else
-#define SQW_PUSH_ROWS() FramePush::lastRows()
-#endif
-#if defined(CYD32C)
-#include "gt911_touch.h"
-#endif
 #include <XPT2046_Touchscreen.h>
 #include <Preferences.h>  // AWOK's own per-rotation touch-cal storage; see the AWOK block below pollTouch()'s globals
 #include <esp_heap_caps.h>   // heap_caps_get_largest_free_block() -- diagnostics screen
@@ -51,15 +33,8 @@
 #include <esp_heap_caps.h>
 #include "ui_diagnostics.h"   // CrashReport, used by the breadcrumb below
 #include "blackbox.h"
-#include "gnss.h"
-#include "lora_sniffer.h"   // the watch's SX1262; inline no-ops elsewhere
-#include "wardrive.h"
 #include "ui_bingo.h"
 #include "bingo.h"
-#include "dex.h"
-#include "ui_dex.h"
-#include "regulars.h"
-#include "notices.h"
 #include "theme.h"            // the crash card on the splash
 #include "clock.h"            // ...and the ten-minute IGNORE on it
 
@@ -77,8 +52,32 @@ RTC_NOINIT_ATTR static struct {
     uint32_t lifetime;
     uint8_t  screen;
 } g_crumb;
-// Why this boot happened, for the black box's boot record.
+// The breadcrumb dies with the power, and a board on a supply that sags
+// comes back saying "power-on" every time, which reads as a clean start.
+// So a count lives in flash: boots in a row that never reached 90 seconds
+// up, whatever the reset reason (a restart the firmware asked for is not
+// counted). Written once a boot and cleared once at 90 seconds. It exists
+// for one line on the crash card -- "N boots in a row, check the power" --
+// and nothing else (the safe mode that once hung off it retired with the
+// crash it was a crutch for).
+static const char* const kBootNs      = "boot";
+static const char* const kShortKey    = "short";   // boots in a row under 90 s
+static const char* const kIgnKey      = "ign";     // IGNORE: clock time the power line comes back
+static const char* const kIgnBootsKey = "ignN";    // IGNORE: boots left before it comes back regardless
+static uint8_t           g_shortBoots  = 0;
 static esp_reset_reason_t g_resetReason = ESP_RST_UNKNOWN;
+// IGNORE on that card: the power line stays off the splash until this
+// clock time, ten minutes from the tap, for a bench that reflashes or a
+// desk where the cable got knocked twice. The count itself goes on. A
+// board with no real clock starts every cold boot from its last note, so
+// ten minutes by that clock could be forever: the ignore also ends after
+// ten more boots, whatever the clock says.
+static uint32_t          g_shortIgnoreUntil = 0;
+static const uint8_t     IGNORE_BOOTS = 10;
+// The IGNORE button on the crash card, for the tap: drawn at the card's
+// bottom right, y set by drawCrashCard, -1 when there is no button.
+static const int         IGN_W = 64, IGN_H = 18;
+static int               s_ignY = -1;
 
 // Snapshotted at boot, before the live breadcrumb starts overwriting it.
 static CrashReport g_lastCrash = {};
@@ -102,21 +101,6 @@ static bool takeBootCheckSkip() {
     g_bootCheckSkip = 0;
     return esp_reset_reason() == ESP_RST_SW && v == CHKSKIP_MAGIC;
 }
-#if defined(TWATCH_S3)
-// The watch's radio self-heal: how many restarts in a row it has made because
-// it heard nothing at all. Same RTC-memory shape as the flags above: a magic
-// in the top bits, believed only after the heal's own deep-sleep wake (or a
-// software reset, the older way). See
-// twatchRadioHealTick().
-static const uint32_t HEAL_MAGIC = 0x4EA10000u;
-RTC_NOINIT_ATTR static uint32_t g_healWord;
-static uint8_t s_healCount = 0;   // this boot's view of it, read once in setup
-static void takeHealCount() {
-    const uint32_t v = g_healWord;
-    g_healWord = 0;
-    s_healCount = ((esp_reset_reason() == ESP_RST_DEEPSLEEP || esp_reset_reason() == ESP_RST_SW) && (v & 0xFFFF0000u) == HEAL_MAGIC) ? (uint8_t)(v & 0xFF) : 0;
-}
-#endif
 static WipeBoot takeWipeBoot() {
     const uint32_t v = g_wipeBoot;
     g_wipeBoot = 0;
@@ -130,10 +114,24 @@ static WipeBoot takeWipeBoot() {
 
 static void crashReportInit() {
     const esp_reset_reason_t r = esp_reset_reason();
-#if defined(TWATCH_S3)
-    takeHealCount();
-#endif
     g_resetReason = r;
+    {
+        Preferences bp;
+        if (bp.begin(kBootNs, false)) {
+            g_shortIgnoreUntil = bp.getUInt(kIgnKey, 0);
+            if (g_shortIgnoreUntil) {
+                // One of the boots the ignore covers; the last one ends it.
+                const uint8_t left = bp.getUChar(kIgnBootsKey, 0);
+                if (left) bp.putUChar(kIgnBootsKey, left - 1);
+                else { g_shortIgnoreUntil = 0; bp.putUInt(kIgnKey, 0); }
+            }
+            uint8_t n = bp.getUChar(kShortKey, 0);
+            n = (r == ESP_RST_SW || r == ESP_RST_DEEPSLEEP) ? 0 : (uint8_t)(n < 10 ? n + 1 : 10);
+            bp.putUChar(kShortKey, n);
+            bp.end();
+            g_shortBoots = n;             // counts this boot: 1 is an ordinary plug-in
+        }
+    }
     const bool panicked = (r == ESP_RST_PANIC || r == ESP_RST_INT_WDT ||
                            r == ESP_RST_TASK_WDT || r == ESP_RST_WDT);
     // A magic that survived with garbage behind it -- 31 days up and 20 MB
@@ -190,6 +188,15 @@ static void crashCrumbTick(uint32_t now, uint32_t lifetime, uint8_t screen) {
     g_crumb.heapBlock = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
     g_crumb.lifetime  = lifetime;
     g_crumb.screen    = screen;
+    // Ninety seconds up is a boot that lived: the loop, if there was one, is over.
+    if (now > 90000) {
+        static bool cleared = false;
+        if (!cleared) {
+            cleared = true;
+            Preferences bp;
+            if (bp.begin(kBootNs, false)) { bp.putUChar(kShortKey, 0); bp.end(); }
+        }
+    }
 }
 
 // The crash, on the splash. DIAGNOSTICS has shown the last crash since
@@ -197,12 +204,44 @@ static void crashCrumbTick(uint32_t now, uint32_t lifetime, uint8_t screen) {
 // dies before the menu. So on a boot after a panic the splash holds for
 // nine seconds with the same lines in a box at the bottom, and a photo of
 // the splash is the bug report.
-static bool crashCardWanted() { return g_lastCrash.valid || g_lastCrash.haveDump; }
+// The power line, unless IGNORE put it off for a while. A board with no
+// idea of the time reads 0 from the clock, and 0 is never "before the
+// deadline": an unset clock cannot make the line disappear, it only makes
+// the ten minutes shorter -- the tap zeroes the count too, so the line is
+// off until two more short boots either way.
+static bool shortBootsShown() {
+    const uint32_t nowE = Clock::nowEpoch();
+    return g_shortBoots >= 2 && !(g_shortIgnoreUntil && nowE && nowE < g_shortIgnoreUntil);
+}
+static bool crashCardWanted() { return g_lastCrash.valid || g_lastCrash.haveDump || shortBootsShown(); }
+static void ignoreShortBoots() {
+    const uint32_t nowE = Clock::nowEpoch();
+    g_shortIgnoreUntil = nowE ? nowE + 600 : 0;
+    g_shortBoots = 0;
+    Preferences bp;
+    if (bp.begin(kBootNs, false)) {
+        bp.putUInt(kIgnKey, g_shortIgnoreUntil);
+        bp.putUChar(kIgnBootsKey, IGNORE_BOOTS);
+        bp.putUChar(kShortKey, 0);
+        bp.end();
+    }
+    Serial.println(nowE ? "[boot] the short-boot line is off the splash for ten minutes, count zeroed"
+                        : "[boot] no clock to time ten minutes by; the short-boot count is zeroed instead");
+}
+// The IGNORE button's tap target, a little larger than the button.
+static bool ignoreButtonHit(int x, int y, int w) {
+    if (s_ignY < 0) return false;
+    const int bx = w - 8 - IGN_W;
+    return x >= bx - 6 && x < bx + IGN_W + 6 && y >= s_ignY - 6 && y < s_ignY + IGN_H + 6;
+}
 static const char* resetReasonName();
 static void drawCrashCard(TFT_eSPI& t) {
     const int w = t.width(), h = t.height();
-    const int lines = 1 + (g_lastCrash.haveDump ? 2 : (g_lastCrash.valid ? 1 : 0));
-    const int bh = 8 + lines * 11;
+    const bool shortLine = shortBootsShown();
+    const bool power = shortLine && !g_lastCrash.valid && !g_lastCrash.haveDump;   // the loop, not a crash
+    const int lines = 1 + (g_lastCrash.haveDump ? 2 : (g_lastCrash.valid ? 1 : 0)) + (shortLine ? 1 : 0);
+    const int bh = 8 + lines * 11 + (power ? 24 : 0);
+    s_ignY = -1;
     const int y0 = h - bh - 4;
     t.fillRoundRect(4, y0, w - 8, bh, 4, Theme::BG);
     t.drawRoundRect(4, y0, w - 8, bh, 4, Theme::RED);
@@ -230,6 +269,16 @@ static void drawCrashCard(TFT_eSPI& t) {
         snprintf(line, sizeof line, "ON: screen %u, %lu detections", (unsigned)g_lastCrash.screen,
                  (unsigned long)g_lastCrash.lifetime);
         t.setCursor(10, y); t.print(line); y += 11;
+    }
+    if (shortLine) {
+        snprintf(line, sizeof line, "%u BOOTS IN A ROW UNDER 90 S%s", (unsigned)g_shortBoots,
+                 (g_resetReason == ESP_RST_POWERON || g_resetReason == ESP_RST_BROWNOUT) ? ": CHECK THE POWER" : "");
+        t.setCursor(10, y); t.print(line); y += 11;
+    }
+    if (power) {
+        // IGNORE: off the splash for ten minutes, and on with the boot now.
+        s_ignY = y0 + bh - IGN_H - 3;
+        Theme::drawWin95Button(t, w - 8 - IGN_W, s_ignY, IGN_W, IGN_H, "IGNORE", false);
     }
 }
 #include "state.h"
@@ -283,10 +332,6 @@ static void drawCrashCard(TFT_eSPI& t) {
 #include "ui_security.h"
 #include "squachy.h"
 #include "cap_touch.h"
-#if defined(TWATCH_S3)
-#define XPOWERS_CHIP_AXP2101
-#include <XPowersLib.h>
-#endif
 #include "touch_cal.h"
 #include "settings.h"
 #include "signatures.h"
@@ -300,9 +345,6 @@ static void drawCrashCard(TFT_eSPI& t) {
 #endif
 #include "status_light.h"
 #include "ui_light.h"
-#if SQUACH_LORA
-#include "ui_lorachat.h"
-#endif
 
 // Two CYD board variants are supported from this one firmware:
 //   - jczn_2432s028r (original): resistive XPT2046 touch on its own
@@ -359,7 +401,14 @@ static void drawCrashCard(TFT_eSPI& t) {
     #define TOUCH_SHARES_DISPLAY_BUS 1
 #endif
 
-#if defined(CYD35)
+#if defined(LCDWIKI_ES3C28P)
+    #define CAP_SDA    16
+    #define CAP_SCL    15
+    #define CAP_RST    18
+    #define TOUCH_SCK  TFT_SCLK
+    #define TOUCH_MOSI TFT_MOSI
+    #define TOUCH_MISO TFT_MISO
+#elif defined(CYD35)
     #define TOUCH_SCK  TFT_SCLK
     #define TOUCH_MOSI TFT_MOSI
     #define TOUCH_MISO TFT_MISO
@@ -383,9 +432,11 @@ static void drawCrashCard(TFT_eSPI& t) {
 #define TOUCH_CS   33
 #endif
 #define TOUCH_IRQ  36
+#ifndef CAP_SDA
 #define CAP_SDA    33
 #define CAP_SCL    32
 #define CAP_RST    25
+#endif
 // Backlight brightness (Settings menu): all three boards' backlight
 // pins are driven at boot regardless of which one is actually wired
 // (see the digitalWrite(HIGH) comment in setup() — same reasoning
@@ -396,10 +447,11 @@ static void drawCrashCard(TFT_eSPI& t) {
 #define BL_PIN_ORIG 21
 #define BL_PIN_CAP  27
 #define BL_PIN_AWOK 32
-#define BL_PIN_S3   45   // the T-Watch S3's and the Freenove S3's, both
 #define BL_CH_ORIG  0
 #define BL_CH_CAP   1
 #define BL_CH_AWOK  2
+#define BL_PIN_LCDWIKI 45
+#define BL_CH_LCDWIKI 3
 
 // invertDisplay() sets an ABSOLUTE panel state -- it doesn't toggle
 // relative to whatever TFT_INVERSION_ON/OFF a board's user-setup header
@@ -414,23 +466,7 @@ static void drawCrashCard(TFT_eSPI& t) {
 // relative to it. File-scope (not local to setup()) so the Settings >
 // INVERT row handler in loop() can use the same XOR instead of
 // clobbering this baseline with an absolute call.
-#if defined(TWATCH_S3)
-// Confirmed on the watch 2026-09-22: the ST7789 wants inversion on (as
-// LilyGo's own setup says); false showed every colour inverted.
-constexpr bool PANEL_NEEDS_INVERSION = true;
-#elif defined(FREENOVE_S3)
-// Freenove's own setup for the S3 2.8" (FNK0104AB) turns inversion on, and
-// confirmed on an FNK0104B 2026-09-25: colours right with INVERT untouched.
-constexpr bool PANEL_NEEDS_INVERSION = true;
-#elif defined(CYD32C)
-// The same IPS ST7789 as the Freenove 3.2". UNCONFIRMED until looked at;
-// INVERT in Settings flips it if wrong.
-constexpr bool PANEL_NEEDS_INVERSION = true;
-#elif defined(FREENOVE32)
-// Freenove's own setup for the 3.2" turns inversion on. UNCONFIRMED here
-// until the board is looked at; INVERT in Settings flips it if wrong.
-constexpr bool PANEL_NEEDS_INVERSION = true;
-#elif defined(CYD35)
+#if defined(CYD35)
 // UNCONFIRMED on real hardware post-fix: the original port's "true"
 // guess predates discovering the override bug above, so whatever
 // testing produced that value was toggling a header define that does
@@ -444,11 +480,6 @@ constexpr bool PANEL_NEEDS_INVERSION = false;
 // point) but looked inverted/wrong. false is the ILI9341's normal
 // (non-inverted) polarity, matching the original CYD board this panel
 // shares a driver with.
-constexpr bool PANEL_NEEDS_INVERSION = false;
-#elif defined(CROWPANEL7)
-// An RGB panel has no inversion register at all; Panel_RGB's invertDisplay()
-// is a no-op and CrowPanelTFT hides it. False keeps the XOR in the Settings
-// handler meaningful rather than pretending a control exists.
 constexpr bool PANEL_NEEDS_INVERSION = false;
 #else
 constexpr bool PANEL_NEEDS_INVERSION = false;
@@ -487,15 +518,7 @@ public:
 };
 
 // ---- Globals ----
-#if defined(CROWPANEL7)
-// Not a TFT_eSPI: an 800x480 RGB parallel panel driven by ESP-IDF's esp_lcd, wearing
-// TFT_eSPI's interface because `canvas` below upcasts the sprite to the
-// device type and only this hierarchy gives the two a common base. Nothing
-// is ever sent to an SPI display bus on this board -- see the header.
-CrowPanelTFT        tft;
-#else
 TFT_eSPI            tft = TFT_eSPI();
-#endif
 // All screens draw into this off-screen buffer, pushed to the physical
 // display in one shot at the end of each loop(). Without it, every
 // screen's erase-then-redraw sequence is briefly visible on real
@@ -549,12 +572,6 @@ Confidence          lastAlertConf = Confidence::HIGH_CONF;
 uint32_t            lastAlertHits = 1; // times this exact MAC+type has ever matched — see Squachy's "seen before" reaction
 int8_t              lastAlertRssi = 0; // signal strength of that hit — scales how hard Squachy reacts to it
 const uint16_t      TOUCH_DEBOUNCE_MS = 200;
-// The longest a touch can last and still be a tap on a list. A thumb that
-// rests on a row for longer was reaching in to scroll, not choosing -- people
-// kept opening rows they were only scrolling past -- so a long touch that
-// never moved is spent, not acted on. Long presses that mean something (a
-// LOG row's WATCH/HUNT) are timed separately and unaffected.
-static const uint32_t TAP_MAX_MS = 500;
 
 // Hidden "unlock every Squachy outfit" gesture: hold the third button (DESK)
 // for CLR_UNLOCK_HOLD_MS on the CLEAR screen (see the CLEAR case's touch
@@ -653,15 +670,12 @@ static bool rawReadResistive(int16_t& a, int16_t& b);
 // (rotation 1). Not const: overwritten at boot if a saved calibration
 // exists (see loadOrDefaultCal()/TouchCal), and by the long-press
 // calibration flow (see checkCalibrationTrigger()).
-#if defined(CROWPANEL7)
-// The GT911 reports panel pixels, so these make initTouchFit()'s affine map a
-// plain divide by CROWPANEL_SCALE (2 here, 1 in the -native build) -- no
-// calibration is needed or wanted.
-static uint16_t CAP_NX_MIN = CROW_CAP_NX_MIN, CAP_NX_MAX = CROW_CAP_NX_MAX;
-static uint16_t CAP_NY_MIN = CROW_CAP_NY_MIN, CAP_NY_MAX = CROW_CAP_NY_MAX;
+#if defined(LCDWIKI_ES3C28P)
+static uint16_t CAP_NX_MIN = 0,  CAP_NX_MAX = 240;
+static uint16_t CAP_NY_MIN = 0,  CAP_NY_MAX = 320;
 #else
-static uint16_t CAP_NX_MIN = 32,  CAP_NX_MAX = 166;
-static uint16_t CAP_NY_MIN = 10,  CAP_NY_MAX = 308;
+static uint16_t CAP_NX_MIN = 32, CAP_NX_MAX = 166;
+static uint16_t CAP_NY_MIN = 10, CAP_NY_MAX = 308;
 #endif
 // Resistive XPT2046 raw ADC range — same idea, factory default was a
 // flat 200-3800 for both axes; not const for the same reason.
@@ -869,20 +883,11 @@ static bool rawReadFiltered(int16_t& a, int16_t& b) {
 // The one reader pollTouch(), the calibration and the diagnostics screen all
 // use, so what the calibration measures is exactly what touch then reads.
 static bool readTouchRaw(int16_t& a, int16_t& b) {
-#if defined(CROWPANEL7) || defined(CYD32C)
-    // The GT911 already reports panel pixels; TouchFit divides by the scale,
-    // so nothing else differs.
-    uint16_t x, y;
-    if (!Gt911::read(x, y)) return false;
-    a = (int16_t)x; b = (int16_t)y;
-    return true;
-#else
     if (usingCapTouch) return rawReadCap(a, b);
 #if defined(TOUCH_ON_DISPLAY_BUS) || defined(CYD35)
     return rawReadFiltered(a, b);
 #else
     return rawReadResistive(a, b);
-#endif
 #endif
 }
 
@@ -891,60 +896,11 @@ static bool readTouchRaw(int16_t& a, int16_t& b) {
 // coming back from a reboot into a dimmed screen with no memory of why would
 // look exactly like a broken backlight.
 static bool s_screenDimmed = false;
-#if defined(TWATCH_S3)
-// A watch goes dark, not dim. When the screen timeout lands, the backlight
-// goes off and the ST7789 is put to sleep (DISPOFF, SLPIN: about a milliamp
-// instead of tens), and pushFrame() stops sending frames it would not show.
-// A tap or the crown wakes it: SLPOUT needs 120 ms before DISPON, which is
-// the one delay a person can feel here, and it is once per wake.
-static bool s_panelAsleep = false;
-#if defined(TWATCH_S3)
-// A crown press with the screen on turns it off at once, cable or not.
-// It stays off until the next touch, crown press or alert: lastTouch
-// moving past this moment is what ends it.
-static bool     s_crownDark   = false;
-static uint32_t s_crownDarkAt = 0;
-// After an alert lights a crown-darkened screen, it stays lit until this
-// moment -- the screen timeout, counted from the alert's end -- then goes
-// dark again. 0 = no alert has lit it.
-static uint32_t s_crownLitUntil = 0;
-// On the cable, read every two seconds in twatchRadioTick(). The screen
-// stays lit while it is true: a watch on its charger is a desk clock.
-static bool     s_onUsb = true;
-#endif
-static bool s_radiosResting = false;   // the duty cycle's state; see twatchRadioTick()
-#endif
 
-static void applyCpuClock();
 static void applyBrightness() {
     uint8_t duty = s_screenDimmed ? Settings::dimLevel() : Settings::brightness();
-#if defined(TWATCH_S3)
-    if (s_screenDimmed) {
-        if (!s_panelAsleep) {
-            ledcWrite(BL_CH_ORIG, 0);
-            tft.writecommand(0x28);   // DISPOFF
-            tft.writecommand(0x10);   // SLPIN
-            s_panelAsleep = true;
-            Serial.println("[panel] asleep");
-            applyCpuClock();   // SLEEP CPU
-        }
-        return;
-    }
-    if (s_panelAsleep) {
-        tft.writecommand(0x11);   // SLPOUT
-        delay(120);
-        tft.writecommand(0x29);   // DISPON
-        s_panelAsleep = false;
-        FramePush::invalidate();
-        Serial.println("[panel] awake");
-        applyCpuClock();   // back to CPU CLOCK
-    }
-#endif
-#if defined(CROWPANEL7)
-    // No backlight GPIO on this board: an STC8H1K28 helper MCU owns it and
-    // takes a bare I2C command byte on an inverted scale. CrowBL::set()
-    // keeps the firmware's own 0..255-with-255-brightest convention.
-    CrowBL::set(duty);
+#if defined(LCDWIKI_ES3C28P)
+    ledcWrite(BL_CH_LCDWIKI, duty);
 #else
     ledcWrite(BL_CH_ORIG, duty);
     ledcWrite(BL_CH_CAP,  duty);
@@ -960,12 +916,7 @@ static void applyBrightness() {
 // would be both wasteful and a good way to find a driver's re-entrancy bug.
 static uint16_t s_cpuMhzApplied = 240;
 static void applyCpuClock() {
-    uint16_t want = Settings::cpuMhz();
-#if defined(TWATCH_S3)
-    // Asleep, the watch only listens and waits for a tap: SLEEP CPU, which
-    // never goes above the screen-on clock. About 25 mA at 80 instead of 240.
-    if (s_panelAsleep) { const uint16_t idle = Settings::idleCpuMhz(); if (idle < want) want = idle; }
-#endif
+    const uint16_t want = Settings::cpuMhz();
     if (want == s_cpuMhzApplied) return;
     setCpuFrequencyMhz(want);
     s_cpuMhzApplied = want;
@@ -1086,13 +1037,6 @@ static char    s_confirmLabel[24];
 // touch this, only LOG's do.
 static bool    s_confirmIsBle = true;
 static bool s_alertLastFree = false;
-static bool s_alertSpam     = false;   // this alert is a spam flood's one announcement
-#if defined(CROWPANEL7)
-// The chirp's length. A pass on this board is 34-59 ms and the OFF goes out
-// on the first pass at or after this, so the real sound runs 80-140 ms:
-// a chirp, not an alarm. The probe's bench chirp is 120.
-static const uint16_t BUZZ_CHIRP_MS = 80;
-#endif
 
 // Whether a sighting may take the screen, and AUTO SNOOZE's bookkeeping
 // with it. Call it once for each alert about to be raised and obey the
@@ -1101,71 +1045,13 @@ static const uint16_t BUZZ_CHIRP_MS = 80;
 // The WATCH target is exempt outright. Asking to be told about one device is
 // the clearest statement of intent this board takes, and a feature whose
 // whole job is to interrupt less must never be the thing that overrides it.
-#if defined(TWATCH_S3)
-static bool twatchStill();
-#endif
 static bool alertMayInterrupt(const Detection& d) {
     const bool exempt = engine.isWatched(d.mac, true) || engine.isWatched(d.mac, false);
-#if defined(TWATCH_S3)
-    // TAGS + RINGS: logged, never announced. A day's wear was 50 screen
-    // wakes an hour on the drive home, 52 of 83 sightings AirTags from 42
-    // different passing cars, and 126 of 256 at work from twelve Rings.
-    if (!exempt && Settings::quietTrackers()) {
-        switch (d.type) {
-            case DetectionType::AIRTAG: case DetectionType::TILE: case DetectionType::SAMSUNG_TAG:
-            case DetectionType::GOOGLE_TAG: case DetectionType::RING:
-                return false;
-            default: break;
-        }
-    }
-#endif
-    // A flood of fake tags of this type: one alert says so, and the rest are
-    // logged without interrupting until it has been quiet five minutes. See
-    // spam_watch.h. A device you asked to WATCH still always gets through.
-    s_alertSpam = false;
-    if (!exempt && d.channel == 0 && engine.spam().active((uint8_t)d.type, millis())) {
-        if (!engine.spam().takeAnnounce((uint8_t)d.type)) return false;
-        s_alertSpam     = true;
-        s_alertLastFree = false;
-        Serial.printf("[spam] %s flood announced: %u fakes so far\n", detectionTypeName(d.type),
-                      (unsigned)engine.spam().fakes((uint8_t)d.type));
-        return true;
-    }
-#if defined(TWATCH_S3)
-    const bool still = twatchStill();
-#else
-    const bool still = false;
-#endif
-    const DetectionEngine::AlertGate g = engine.alertGate(d.mac, Settings::autoQuietAfter(), exempt, still);
-#if defined(TWATCH_S3)
-    if (g == DetectionEngine::AlertGate::HOLD)
-        Serial.printf("[snooze] %02x:%02x held, watch %s\n", d.mac[4], d.mac[5], still ? "still" : "moving");
-#endif
-    switch (g) {
+    switch (engine.alertGate(d.mac, Settings::autoQuietAfter(), exempt)) {
         case DetectionEngine::AlertGate::HOLD:       return false;
-        case DetectionEngine::AlertGate::ALLOW_LAST: s_alertLastFree = true;  break;
-        default:                                     s_alertLastFree = false; break;
+        case DetectionEngine::AlertGate::ALLOW_LAST: s_alertLastFree = true;  return true;
+        default:                                     s_alertLastFree = false; return true;
     }
-#if defined(CROWPANEL7)
-    // The chirp, on the board that has something to chirp with. HERE and not
-    // in enterAlert(): this is the one gate every AUTOMATIC announcement
-    // passes -- the main screen, the desk's small card, the lock screen, the
-    // update window -- and none of the manual ones (NEARBY's hold, a tap on
-    // the desk card), which open a card for something already on the glass.
-    // Everything upstream of this line is the board's own idea of
-    // alert-worthy: within ALERT_GRACE_MS of firstSeen, past ALERT FILTER,
-    // not ignored or snoozed, and now past AUTO SNOOZE. The buzzer adds four
-    // of its own: it is switched on; the row is one the log never held (a
-    // device coming back is news to the screen, not to the room); the saver
-    // has not dimmed the screen -- read now, because the alert un-dims it
-    // later in this same pass; and it is not the hour the card calls AT
-    // NIGHT. Never at boot (no automatic alert runs before loop()) and never
-    // through a wipe (performWipe() silences it first).
-    if (Settings::buzzerOn() && &d == engine.latest() && engine.latestIsNew() &&
-        !s_screenDimmed && !Clock::night())
-        CrowBuzzer::chirp(BUZZ_CHIRP_MS);
-#endif
-    return true;
 }
 
 // The current alert's target, captured in enterAlert(). Kept separate
@@ -1221,19 +1107,14 @@ static bool    s_confirmArmed = false;
 // The compiled-in ranges are a 2.8" board's. Anywhere else -- the digitisers
 // on the display's own bus -- they put taps nowhere near the finger, so a
 // board with nothing better has no SKIP to offer.
-#if defined(TOUCH_SHARES_DISPLAY_BUS) || defined(CYD35) || defined(SQW_S3)
+#if defined(TOUCH_SHARES_DISPLAY_BUS) || defined(CYD35)
 static const bool DEFAULT_TOUCH_USABLE = false;
 #else
 static const bool DEFAULT_TOUCH_USABLE = true;
 #endif
 
-static bool s_calRanThisBoot = false;   // for the RADIO report on the watch
 static void runTouchCalibration() {
-    s_calRanThisBoot = true;
     TouchFit::Fit fit;
-#if defined(TWATCH_S3)
-    TouchCal::setDensityScale(1.6f);   // 240 px across 27 mm, against the 2.8" board's 5.6 px/mm
-#endif
     const bool canSkip = s_calSource != CalSource::BUILT_IN || DEFAULT_TOUCH_USABLE;
     const TouchCal::Outcome r =
         TouchCal::runInteractive(tft, readTouchRaw, screenRotation,
@@ -1248,10 +1129,6 @@ static void runTouchCalibration() {
         s_calSource = CalSource::SAVED;
     }
     FramePush::invalidate();
-    // The finger that just did all that counts as a touch: lastTouch was
-    // still 0 from boot, so with the power saver on, a calibration longer
-    // than the screen timeout came back to a screen already dimmed.
-    lastTouch = millis();
 }
 
 static void enterBoot() {
@@ -1271,9 +1148,6 @@ static void enterBoot() {
 static bool s_scanPickerOpen = false;
 
 static void enterLocked();
-// The frame buffer lent to a WiFi download, and taken back; defined with the update code below.
-static void lendFrameToDownload();
-static void restoreFrameBuffer();
 // Every way home goes through here, which makes it the one place the lock has
 // to be honoured: while locked, "home" is the lock screen.
 // An ALERT opened from the desk's small card goes back to the desk when it
@@ -1293,7 +1167,6 @@ static bool onRawScanScreen() {
 }
 static void enterClear() {
     if (Security::locked()) { enterLocked(); return; }
-    restoreFrameBuffer();   // lent to a download that did not end in a restart
     if (s_backToDesk) { s_backToDesk = false; enterDesk(); return; }
     Settings::deskActive(false);
     Theme::releaseClockBackdrop();   // the clock fire's heat, if the desk had one
@@ -1351,25 +1224,9 @@ static bool s_alertArmed = true;
 // main screen: his bubble lives there, not on the card.
 static char s_firstLine[64] = "";
 
-// Every catch Squachy hears about goes through here, so the things the
-// engine's numbers do not carry -- the device's neighbour-name, whether the
-// type is his nemesis, whether it came closer than ever -- reach him too.
-static void squachyCatch(DetectionType type, const uint8_t* mac, uint32_t hits, int8_t rssi, Confidence conf) {
-    Squachy::catchContext(Regulars::nameFor(mac), Regulars::takeNewRegular(mac),
-                          Dex::nemesis(engine) == type, Dex::takeNewClosest(type));
-    Squachy::trigger(Squachy::Event::DETECTION, type, engine.lifetimeTotal(), hits, rssi, conf);
-}
-
-#if defined(TWATCH_S3)
-enum class Buzz : uint8_t { ALERT, WATCH, SAMPLE, MESSAGE };
-static void twatchBuzz(Buzz kind);
-#endif
 static void enterAlert(const Detection& d) {
     s_backToDesk = (state == AppState::DESK);
     state = AppState::ALERT;
-#if defined(TWATCH_S3)
-    twatchBuzz(Buzz::ALERT);
-#endif
     // FIRST. uiAlertInit() clears the card's banner flags, and it used to run
     // at the END of this function -- after the two uiAlertSet* calls below --
     // so it wiped them both every time. FIRST OF ITS KIND and AT NIGHT have
@@ -1386,10 +1243,6 @@ static void enterAlert(const Detection& d) {
         const bool night = Clock::night();
         uiAlertSetNight(night);
         uiAlertSetLastFree(s_alertLastFree);
-        // Spent here: a card opened by hand (NEARBY) must not inherit a
-        // flood's banner from the last automatic one.
-        uiAlertSetSpam(s_alertSpam, engine.spam().fakes((uint8_t)d.type));
-        s_alertSpam = false;
         if (night && !first) {
             static const char* const NIGHT_LINES[] = {
                 "A %s at this hour. That's not nothing.", "%s. At night. I don't love it.",
@@ -1433,9 +1286,6 @@ static void enterAlert(const Detection& d) {
 
 static void enterWatchAlert() {
     state = AppState::WATCH_ALERT;
-#if defined(TWATCH_S3)
-    twatchBuzz(Buzz::WATCH);
-#endif
     watchAlertStart = millis();
     transitionStart = watchAlertStart;
     uiWatchAlertInit(*canvas);
@@ -1465,7 +1315,6 @@ static void enterRawScan(bool isBle) {
 }
 
 static void enterSettings() {
-    restoreFrameBuffer();   // lent to a download that did not end in a restart
     Settings::deskActive(false);
     Theme::releaseClockBackdrop();
     state = AppState::SETTINGS;
@@ -1528,12 +1377,6 @@ static void enterBingo() {
     uiBingoInit(*canvas);
 }
 
-static void enterDex() {
-    state = AppState::DEX;
-    transitionStart = millis();
-    uiDexInit(*canvas);
-}
-
 static void enterSquadUpdate() {
     state = AppState::SQUAD_UPDATE;
     transitionStart = millis();
@@ -1551,23 +1394,6 @@ static void enterInvite() {
     if (s_screenDimmed) { s_screenDimmed = false; applyBrightness(); }
     uiInviteInit(*canvas);
 }
-
-// INVERT and ROT on the console -- see clock.cpp. Consumed in loop().
-volatile bool g_consoleInvert = false;
-volatile bool g_consoleAdc = false;     // ADC: the spare analog inputs, for finding a battery sense line
-volatile bool g_consoleRotate = false;
-volatile bool g_consoleWatchTest = false; // WATCHTEST: watch the newest Bluetooth device, fire its alert
-volatile bool g_consoleRadioTest = false; // RADIO TEST: cycle even on the cable with the screen on (bench)
-volatile bool g_consoleBatt    = false;   // BATT: one reading, now
-volatile bool g_consoleBattLog = false;   // BATTLOG: every sample kept, newest first
-volatile bool g_consoleHeal = false;  // RADIO HEAL: take the self-heal path now, as if deaf (watch)
-volatile bool g_consoleXtal = false;   // XTAL: CLOCK CHECK from the console (watch)
-volatile bool g_consoleMotion = false; // MOTION: the motion sensor's reading and verdict (watch)
-volatile bool g_consoleBuzz = false;  // BUZZ: play the alert pattern now and report the driver (watch)
-volatile bool g_consoleRtc = false;   // RTC: read the clock chip (watch)
-volatile bool g_consolePmu = false;   // PMU: dump the power chip's registers (watch)
-volatile uint8_t g_consoleGps = 0;    // GPS, WARDRIVE and WIGLE commands: the S3 Plus's GNSS (watch)
-volatile int32_t g_consoleFakeLat7 = 0, g_consoleFakeLon7 = 0;   // GPS FAKE lat lon
 
 #ifdef BENCH_TOOLS
 // UPDATE NOW and UPDATE STOP on the console, for the bench: the unattended
@@ -1625,7 +1451,6 @@ static void autoUpdateTick(uint32_t now) {
             if (!OtaWifi::end()) { engine.stopUpdateRadio(); enterClear(); }
         } else {
             MeshTalk::markNudged();
-            lendFrameToDownload();
             OtaWifi::install();
         }
     } else if (ws == OtaWifi::State::FAILED) {
@@ -1643,66 +1468,27 @@ static void autoUpdateTick(uint32_t now) {
 #endif
 
 // The frame buffer, handed back: 77 KB at 320x240, the biggest single
-// allocation on the heap. The duress wipe does it because the board is
-// about to restart and the copying the wipe does ran the heap dry without
+// allocation on the heap. Only the duress wipe does this now -- the board is
+// about to restart, and the copying the wipe does ran the heap dry without
 // it. Afterwards the screens draw straight to the panel, the fallback a
 // failed rotate already uses.
-static void releaseFrameBuffer(const char* who) {
+//
+// WiFi updates used to do it too, for a TLS handshake that wanted 17 KB in
+// one piece. The download is plain HTTP since v1.10.2 and needs no such
+// block, so an update now keeps the screen it is drawing on.
+#if HAVE_NVS_ERASE
+static void releaseFrameBuffer() {
 #if !defined(CYD35)
     if (!frameBufferOk) return;
     frame.deleteSprite();
     frameBufferOk = false;
     canvas = &tft;
     tft.fillScreen(Theme::BG);
-    Serial.printf("[%s] frame buffer released: largest block %lu\n", who,
+    Serial.printf("[wipe] frame buffer released: largest block %lu\n",
                   (unsigned long)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
-#else
-    (void)who;
 #endif
 }
-
-// A WiFi download lends it out too. The buffer went back to being kept
-// through updates in v1.12.0, once plain HTTP had done away with the one
-// 17 KB block TLS wanted -- but it is not one block the download needs, it
-// is room: the WiFi driver and the TCP stack take every packet out of the
-// heap, and by v1.19.0 the board had 18 KB free and a 6 KB largest block
-// the moment the download began. The first 16-30 KB arrived, then nothing
-// could be received, and the connection closed. So the buffer is lent from
-// INSTALL until the board is back on an ordinary screen; the update screen
-// already knows how to draw without it. A successful update restarts; a
-// failed or cancelled one gets the buffer back on its way out, or, if the
-// heap will not give a 77 KB block again, draws unbuffered until a restart
-// (the same fallback a failed rotate takes).
-static bool s_frameLent = false;
-static void lendFrameToDownload() {
-    if (!frameBufferOk) return;
-    releaseFrameBuffer("ota");
-    s_frameLent = true;
-}
-static void restoreFrameBuffer() {
-    if (!s_frameLent) return;
-    s_frameLent = false;
-#if !defined(CYD35)
-    if (frameBufferOk) return;
-    frame.setColorDepth(8);
-#if defined(CROWPANEL7) && CROWPANEL_FRAME_INTERNAL
-    heap_caps_malloc_extmem_enable(1u << 20);   // back into internal RAM, see setup()
 #endif
-    const bool back = frame.createSprite(tft.width(), tft.height());
-#if defined(CROWPANEL7) && CROWPANEL_FRAME_INTERNAL
-    heap_caps_malloc_extmem_enable(CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL);
-#endif
-    if (back) {
-        frame.setTextSize(1);
-        frameBufferOk = true;
-        canvas = &frame;
-        Serial.println("[ota] frame buffer back");
-    } else {
-        Serial.printf("[ota] frame buffer could not come back (largest block %lu); unbuffered until restart\n",
-                      (unsigned long)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
-    }
-#endif
-}
 
 static void enterWifiPass(const char* ssid) {
     state = AppState::WIFI_PASS;
@@ -1948,7 +1734,7 @@ static void physicalNvsWipe() {
     }
     nvs_release_iterator(it);
     Serial.printf("[wipe] %u entries kept, heap %lu; erasing\n", (unsigned)kept.size(), (unsigned long)ESP.getFreeHeap());
-    serialFlush();
+    Serial.flush();
 
     nvs_flash_erase();       // de-initialises, then erases every page
     nvs_flash_init();
@@ -1984,24 +1770,17 @@ static void performWipe(WipeBoot after) {
     // Dark first. A duress restart has to look like any other restart, and
     // the light is the one thing visible from the back of the board.
     StatusLight::off();
-#if defined(CROWPANEL7)
-    // And silent: a chirp mid-wipe would be the one sound this restart makes.
-    CrowBuzzer::quiet();
-#endif
     Security::wipeSecrets();
     engine.sd().wipe();
     BlackBox::wipe();        // the log and the crash history kept in flash
-#if defined(TWATCH_S3)
-    Wardrive::clear();       // where the watch has been, and everything it heard there
-#endif
 #if HAVE_NVS_ERASE
     // The frame buffer is 77 KB the wipe can have: the board restarts in a
     // moment and the screen is meant to go quiet anyway. Without it the copy
     // of the kept settings ran the heap dry.
-    releaseFrameBuffer("wipe");
+    releaseFrameBuffer();
     physicalNvsWipe();
     Serial.println("[wipe] done, restarting");
-    serialFlush();
+    Serial.flush();
     g_wipeBoot = WIPEBOOT_MAGIC | (uint8_t)after;
     delay(20);
     esp_restart();
@@ -2023,706 +1802,11 @@ static void enterPower() {
     uiPowerInit(*canvas);
 }
 
-#if SQUACH_LORA
-static void enterLoraChat() {
-    state = AppState::LORA_CHAT;
-    transitionStart = millis();
-    uiLoraChatInit(*canvas);
-}
-#endif
-
 static void enterLight() {
     state = AppState::STATUS_LIGHT;
     transitionStart = millis();
     uiLightInit(*canvas);
 }
-
-#if defined(TWATCH_S3)
-// The T-Watch S3's AXP2101 gates the screen backlight (ALDO2), the touch
-// chip (ALDO3), the RTC's supply (ALDO1), the radio (ALDO4) and the haptic
-// driver (BLDO2). Nothing on the display or touch bus answers until these
-// are on, so this runs first thing in setup(). Rails and volts are LilyGo's
-// own from LilyGoLib.cpp; the charger is left at the chip's defaults.
-static XPowersAXP2101 s_pmu;
-static bool           s_pmuOk = false;
-static void twatchPowerUp() {
-    Wire1.begin(10, 11);
-    s_pmuOk = s_pmu.begin(Wire1, AXP2101_SLAVE_ADDRESS, 10, 11);
-    if (!s_pmuOk) { Serial.println("[pmu] AXP2101 did not answer -- screen may stay dark"); return; }
-    // The chip's own rail, set rather than assumed: a full power-off (a dead
-    // battery) puts the PMU back to its register defaults. It read 3300
-    // either way on 2026-09-23; the deaf radios that morning were not this.
-    s_pmu.enableVbusVoltageMeasure();
-    s_pmu.enableSystemVoltageMeasure();
-    s_pmu.enableBattVoltageMeasure();
-    Serial.printf("[pmu] DC1 %u mV (%s), ALDO4 %u mV, VBUS %u mV, SYS %u mV, VBUS limit code %u, charge code %u\n",
-                  (unsigned)s_pmu.getDC1Voltage(), s_pmu.isEnableDC1() ? "on" : "off",
-                  (unsigned)s_pmu.getALDO4Voltage(), (unsigned)s_pmu.getVbusVoltage(),
-                  (unsigned)s_pmu.getSystemVoltage(), (unsigned)s_pmu.getVbusCurrentLimit(),
-                  (unsigned)s_pmu.getChargerConstantCurr());
-    s_pmu.setDC1Voltage(3300);
-    // The USB input limit and the charge current. After a full power-off the
-    // PMU is back to its register defaults, and with the cell flat the
-    // system rail is whatever the USB path is allowed to pass: not enough
-    // for a radio burst. 500 mA from USB, 200 mA into the cell (LilyGo's
-    // own example uses 1500 and 200).
-    s_pmu.setVbusCurrentLimit(XPOWERS_AXP2101_VBUS_CUR_LIM_500MA);
-    s_pmu.setChargerConstantCurr(XPOWERS_AXP2101_CHG_CUR_200MA);
-    s_pmu.setSysPowerDownVoltage(2600);
-    s_pmu.setALDO1Voltage(3300); s_pmu.enableALDO1();   // RTC
-    s_pmu.setALDO2Voltage(3300); s_pmu.enableALDO2();   // backlight supply
-    s_pmu.setALDO3Voltage(3300); s_pmu.enableALDO3();   // touch
-    s_pmu.setALDO4Voltage(3300); s_pmu.enableALDO4();   // radio
-    s_pmu.setBLDO2Voltage(3300); s_pmu.enableBLDO2();   // DRV2605 haptics
-
-    s_pmu.disableDC2(); s_pmu.disableDC4(); s_pmu.disableDC5();
-    s_pmu.disableDLDO2();
-    // The crown is the PMU's power key. A short press is read as an IRQ flag
-    // from the loop (see twatchCrownTick); a long press powers the watch off
-    // in the chip itself, which is what a watch's crown should do.
-    s_pmu.disableIRQ(XPOWERS_AXP2101_ALL_IRQ);
-    s_pmu.clearIrqStatus();
-    s_pmu.enableIRQ(XPOWERS_AXP2101_PKEY_SHORT_IRQ);
-    // The clock chip's backup cell. LilyGo's own setup charges it; ours did
-    // not, so the chip would lose the time the first time the battery ran
-    // flat.
-    s_pmu.setButtonBatteryChargeVoltage(3300);
-    s_pmu.enableButtonBatteryCharge();
-    delay(20);
-    Serial.printf("[pmu] AXP2101 up: battery %d%%, %s\n", s_pmu.getBatteryPercent(),
-                  s_pmu.isVbusIn() ? "on USB" : "on battery");
-}
-#endif
-
-#if defined(FREENOVE_S3)
-// The Freenove S3's battery: a 1-cell LiPo on its JST, a TP4054 charging it
-// from USB, and a 200K/200K divider from the cell to GPIO9 (ADC1, so WiFi does
-// not take it away). No fuel gauge, and the charger's CHRG line goes to an LED
-// rather than a GPIO -- so a voltage and an estimate from it, never "charging".
-// On the cable the cell reads the charger's ~4.2 V, which is the honest reading.
-static uint16_t boardBatteryMv() {
-    uint32_t sum = 0;
-    for (int i = 0; i < 8; i++) sum += analogReadMilliVolts(9);
-    return (uint16_t)(sum / 8 * 2);   // the divider halves it
-}
-// Resting LiPo, per cell: rough, but a percent that moves the right way.
-static uint8_t boardBatteryPct(uint16_t mv) {
-    static const uint16_t MV[]  = { 3300, 3500, 3600, 3700, 3750, 3800, 3850, 3900, 4000, 4100, 4200 };
-    static const uint8_t  PCT[] = {    0,    5,   10,   20,   30,   40,   50,   60,   75,   90,  100 };
-    if (mv <= MV[0]) return 0;
-    for (uint8_t i = 1; i < sizeof MV / sizeof MV[0]; i++)
-        if (mv <= MV[i]) return (uint8_t)(PCT[i-1] + (uint32_t)(PCT[i] - PCT[i-1]) * (mv - MV[i-1]) / (MV[i] - MV[i-1]));
-    return 100;
-}
-// The SYSTEM page's BATTERY row: "81% 4.12V". Under 2.5 V there is no cell on
-// the connector at all (the divider just floats), and it says so.
-void boardBatteryLine(char* out, size_t n) {
-    static uint32_t at = 0;
-    static char     line[16] = "";
-    const uint32_t now = millis();
-    if (!line[0] || now - at >= 2000) {   // eight ADC reads, not eight per frame
-        at = now;
-        const uint16_t mv = boardBatteryMv();
-        if (mv < 2500) snprintf(line, sizeof line, "NONE");
-        else snprintf(line, sizeof line, "%u%% %u.%02uV", (unsigned)boardBatteryPct(mv),
-                      (unsigned)(mv / 1000), (unsigned)(mv % 1000 / 10));
-    }
-    snprintf(out, n, "%s", line);
-}
-#endif
-
-#if defined(TWATCH_S3)
-// One battery sample into the black box. See BattRecord for what it holds
-// and why. Printed too, so a bench run shows the same line the ring keeps.
-// ---- the haptic motor: a DRV2605 on the power chip's bus ------------------
-// Driven by register, no library: out of standby, the ERM effect library,
-// internal trigger, then a sequence of effect numbers and waits and GO.
-// Effect 1 is a strong click, 47 a full buzz; a byte with the top bit set is
-// a wait of that many tens of milliseconds.
-static const uint8_t DRV_ADDR = 0x5A;
-static bool s_drvOk = false;
-static uint32_t s_drvAwakeAt = 0;   // when the last buzz woke it; 0 = in standby
-
-static bool drvWrite(uint8_t reg, uint8_t v) {
-    Wire1.beginTransmission(DRV_ADDR);
-    Wire1.write(reg);
-    Wire1.write(v);
-    return Wire1.endTransmission() == 0;
-}
-static uint8_t drvRead(uint8_t reg) {
-    Wire1.beginTransmission(DRV_ADDR);
-    Wire1.write(reg);
-    if (Wire1.endTransmission(false) != 0) return 0;
-    if (Wire1.requestFrom(DRV_ADDR, (uint8_t)1) != 1) return 0;
-    return Wire1.read();
-}
-
-// BUZZ STRENGTH. Library 1 is the driver's table for a 1.3 V motor and was
-// what this shipped with; the watch's motor is a 3 V ERM, so library 2 drives
-// it as hard as it is rated for, and MAX lifts the overdrive clamp from the
-// default 3.1 V to about 3.6 V -- only ever for the fraction of a second an
-// effect lasts. Called at init and whenever the row is tapped; the chip is
-// out of standby on both paths, which the register writes need.
-static void twatchHapticApply() {
-    const uint8_t lvl = Settings::buzzStrength();
-    drvWrite(0x03, lvl == 0 ? 0x01 : 0x02);  // LIBRARY
-    drvWrite(0x17, lvl == 2 ? 0xA5 : 0x8C);  // OD_CLAMP: 5.6 V * n / 255
-}
-
-static void twatchHapticBegin() {
-    if (!s_pmuOk) return;
-    s_drvOk = drvWrite(0x01, 0x00);          // MODE: out of standby, internal trigger
-    if (!s_drvOk) { Serial.println("[buzz] DRV2605 did not answer"); return; }
-    drvWrite(0x02, 0x00);                    // no real-time input
-    twatchHapticApply();                     // library and drive clamp from BUZZ STRENGTH
-    drvWrite(0x1A, drvRead(0x1A) & 0x7F);    // FEEDBACK: ERM, not LRA
-    drvWrite(0x1D, drvRead(0x1D) | 0x20);    // CONTROL3: ERM open loop
-    drvWrite(0x01, 0x40);                    // STANDBY until a buzz: a few uA instead of ~0.5 mA
-    Serial.println("[buzz] DRV2605 ready");
-}
-
-static void twatchBuzz(Buzz kind) {
-    if (!s_drvOk) return;
-    if (kind != Buzz::SAMPLE && !Settings::buzz()) { Serial.println("[buzz] alert, but BUZZ is off"); return; }
-    // A room of Ring cameras alerts every few seconds. One buzz in ten
-    // seconds for those; a device you asked to WATCH always gets through.
-    static uint32_t lastAt = 0;
-    const uint32_t now = millis();
-    if (kind == Buzz::ALERT && lastAt && now - lastAt < 10000) return;
-    lastAt = now;
-    uint8_t seq[8] = { 0 };
-    // Effects from the driver's library: 1 strong click, 14 strong buzz,
-    // 15 a 750 ms alert, 16 a 1000 ms alert, 47 buzz. A byte with the top bit
-    // set is a wait of that many tens of milliseconds.
-    const uint8_t lvl = Settings::buzzStrength();
-    if (kind == Buzz::WATCH) {               // three long buzzes
-        const uint8_t e = lvl == 2 ? 16 : 47;
-        seq[0] = e; seq[1] = 0x80 | 12; seq[2] = e; seq[3] = 0x80 | 12; seq[4] = e;
-    } else if (kind == Buzz::MESSAGE) {      // one click: a message, not an alert
-        seq[0] = lvl == 0 ? 1 : 14;
-    } else {                                 // a double click, or a double buzz
-        const uint8_t e = lvl == 0 ? 1 : lvl == 1 ? 14 : 15;
-        seq[0] = e; seq[1] = 0x80 | 10; seq[2] = e;
-    }
-    drvWrite(0x01, 0x00);                    // out of standby for this one
-    s_drvAwakeAt = millis();
-    for (uint8_t i = 0; i < 8; i++) drvWrite(0x04 + i, seq[i]);
-    const bool go = drvWrite(0x0C, 0x01);    // GO
-    Serial.printf("[buzz] %s%s\n", kind == Buzz::WATCH ? "watch alert" : kind == Buzz::ALERT ? "alert" : kind == Buzz::MESSAGE ? "lora message" : "sample",
-                  go ? "" : " -- the motor driver did not answer");
-}
-
-// ---- the motion sensor: a BMA423 on the same bus --------------------------
-// Used for one thing so far: whether the watch is sitting still, which is
-// what tells a nightstand from a wrist. Raw readings only -- the step counter
-// and tilt features need a program loaded into the chip, and "has it moved"
-// does not. Twice a second, one six-byte read.
-static const uint8_t BMA_ADDR = 0x19;
-static bool     s_bmaOk = false;
-static uint64_t s_moveBits[2] = { 0, 0 };   // one bit a second, the last 128 s; bit 0 is now
-static uint32_t s_moveSec = 0;              // the second bit 0 stands for
-static int16_t  s_acc[3];
-static bool     s_accHave = false;
-// A reading this far from the last one is movement. +-4 g at twelve bits is
-// 512 a g, so about 0.06 g: well above the chip's noise, well below a wrist.
-static const int16_t  MOVE_LSB = 30;
-// Still is fewer than this many seconds with movement in the last two
-// minutes. A sleeper turning over is a few; a walk is most of them.
-static const uint8_t  MOVE_SECS = 10;
-
-static bool bmaWrite(uint8_t reg, uint8_t v) {
-    Wire1.beginTransmission(BMA_ADDR);
-    Wire1.write(reg);
-    Wire1.write(v);
-    const bool ok = Wire1.endTransmission() == 0;
-    delay(1);   // in its power-save mode the chip wants a gap between writes
-    return ok;
-}
-static bool bmaRead(uint8_t reg, uint8_t* buf, uint8_t n) {
-    Wire1.beginTransmission(BMA_ADDR);
-    Wire1.write(reg);
-    if (Wire1.endTransmission(false) != 0) return false;
-    if (Wire1.requestFrom(BMA_ADDR, n) != n) return false;
-    for (uint8_t i = 0; i < n; i++) buf[i] = Wire1.read();
-    return true;
-}
-
-static void twatchMotionBegin() {
-    if (!s_pmuOk) return;
-    uint8_t id = 0;
-    if (!bmaRead(0x00, &id, 1) || id != 0x13) { Serial.printf("[motion] BMA423 did not answer (id %02X)\n", id); return; }
-    bmaWrite(0x7C, 0x00);    // PWR_CONF: power save off while it is set up
-    bmaWrite(0x40, 0x15);    // ACC_CONF: averaging mode, 2 samples, 12.5 Hz
-    bmaWrite(0x41, 0x01);    // ACC_RANGE: +-4 g
-    bmaWrite(0x7D, 0x04);    // PWR_CTRL: accelerometer on
-    bmaWrite(0x7C, 0x03);    // PWR_CONF: power save back on, a few uA
-    s_bmaOk = true;
-    Serial.println("[motion] BMA423 ready");
-}
-
-static uint8_t movedSecs() {
-    return (uint8_t)(__builtin_popcountll(s_moveBits[0]) + __builtin_popcountll(s_moveBits[1]));
-}
-
-// No sensor, no verdict: without one the watch counts as moving, which is
-// how AUTO SNOOZE has always behaved.
-static bool twatchStill() { return s_bmaOk && s_accHave && movedSecs() < MOVE_SECS; }
-
-static void twatchMotionTick(uint32_t now) {
-    if (!s_bmaOk) return;
-    static uint32_t last = 0;
-    if (now - last < 500) return;
-    last = now;
-    uint8_t b[6];
-    if (!bmaRead(0x12, b, 6)) return;
-    bool moved = false;
-    for (uint8_t k = 0; k < 3; k++) {
-        const int16_t a = (int16_t)((uint16_t)b[2 * k + 1] << 8 | b[2 * k]) >> 4;
-        if (s_accHave && abs(a - s_acc[k]) > MOVE_LSB) moved = true;
-        s_acc[k] = a;
-    }
-    const bool wasStill = twatchStill();
-    // Slide the history along to this second.
-    const uint32_t sec = now / 1000, n = sec - s_moveSec;
-    s_moveSec = sec;
-    if (n >= 128)      { s_moveBits[0] = s_moveBits[1] = 0; }
-    else if (n >= 64)  { s_moveBits[1] = s_moveBits[0] << (n - 64); s_moveBits[0] = 0; }
-    else if (n)        { s_moveBits[1] = (s_moveBits[1] << n) | (s_moveBits[0] >> (64 - n)); s_moveBits[0] <<= n; }
-    if (moved) s_moveBits[0] |= 1;
-    if (!s_accHave) { s_accHave = true; return; }
-    const bool isStill = twatchStill();
-    if (isStill != wasStill) Serial.printf("[motion] %s\n", isStill ? "still" : "moving");
-}
-
-// ---- the clock chip: a PCF8563 on the same bus, with a backup cell ---------
-// Kept in UTC. Read once at boot, after Clock::begin(); written whenever the
-// clock learns the real time from anywhere, through Clock::onSet().
-static const uint8_t RTC_ADDR = 0x51;
-// Our mark in the chip's minute-alarm register, with its disabled bit set
-// (and alarm interrupts off in control 2), so nothing acts on it. A chip without it holds somebody else's time:
-// the factory firmware leaves China time in it, eight hours off UTC, and
-// believing that moved the clock by eight hours.
-static const uint8_t RTC_MARK = 0xC2;   // alarm disabled, minute 42
-static bool s_rtcLoading = false;   // our own set at boot: nothing to write back
-
-static uint8_t bcd2bin(uint8_t v) { return (uint8_t)((v >> 4) * 10 + (v & 0x0F)); }
-static uint8_t bin2bcd(uint8_t v) { return (uint8_t)(((v / 10) << 4) | (v % 10)); }
-
-// Days since 1970-01-01 for a civil date, and back (Howard Hinnant's).
-static int32_t daysFromCivil(int y, unsigned m, unsigned d) {
-    y -= m <= 2;
-    const int era = (y >= 0 ? y : y - 399) / 400;
-    const unsigned yoe = (unsigned)(y - era * 400);
-    const unsigned doy = (153 * (m + (m > 2 ? -3 : 9)) + 2) / 5 + d - 1;
-    const unsigned doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    return era * 146097 + (int32_t)doe - 719468;
-}
-static void civilFromDays(int32_t z, int& y, unsigned& m, unsigned& d) {
-    z += 719468;
-    const int era = (z >= 0 ? z : z - 146096) / 146097;
-    const unsigned doe = (unsigned)(z - era * 146097);
-    const unsigned yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
-    y = (int)yoe + era * 400;
-    const unsigned doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    const unsigned mp = (5 * doy + 2) / 153;
-    d = doy - (153 * mp + 2) / 5 + 1;
-    m = mp < 10 ? mp + 3 : mp - 9;
-    y += (m <= 2);
-}
-
-static void rtcWrite(uint32_t epoch) {
-    if (s_rtcLoading || !s_pmuOk) return;
-    int y; unsigned mo, d;
-    civilFromDays((int32_t)(epoch / 86400u), y, mo, d);
-    const uint32_t sod = epoch % 86400u;
-    Wire1.beginTransmission(RTC_ADDR);
-    Wire1.write(0x00);
-    Wire1.write(0x00);                                   // control 1: running
-    Wire1.write(0x00);                                   // control 2: no alarms
-    Wire1.write(bin2bcd((uint8_t)(sod % 60)));           // seconds, VL cleared
-    Wire1.write(bin2bcd((uint8_t)(sod / 60 % 60)));
-    Wire1.write(bin2bcd((uint8_t)(sod / 3600)));
-    Wire1.write(bin2bcd((uint8_t)d));
-    Wire1.write((uint8_t)((epoch / 86400u + 4) % 7));    // 1970-01-01 was a Thursday
-    Wire1.write(bin2bcd((uint8_t)mo));
-    Wire1.write(bin2bcd((uint8_t)(y % 100)));
-    bool ok = Wire1.endTransmission() == 0;
-    Wire1.beginTransmission(RTC_ADDR);
-    Wire1.write(0x09);
-    Wire1.write(RTC_MARK);                               // minute alarm: off, and our mark
-    ok = (Wire1.endTransmission() == 0) && ok;
-    Serial.printf("[rtc] clock chip %s %04d-%02u-%02u %02lu:%02lu UTC\n", ok ? "set to" : "FAILED at",
-                  y, mo, d, (unsigned long)(sod / 3600), (unsigned long)(sod / 60 % 60));
-}
-
-// 0 when the chip is missing, has lost the time (its VL flag), or holds
-// something no build could believe.
-static uint32_t rtcRead(bool* lost = nullptr, bool* foreign = nullptr) {
-    if (lost) *lost = false;
-    if (foreign) *foreign = false;
-    if (!s_pmuOk) return 0;
-    Wire1.beginTransmission(RTC_ADDR);
-    Wire1.write(0x09);
-    if (Wire1.endTransmission(false) != 0 || Wire1.requestFrom(RTC_ADDR, (uint8_t)1) != 1) return 0;
-    if (Wire1.read() != RTC_MARK) { if (foreign) *foreign = true; return 0; }
-    Wire1.beginTransmission(RTC_ADDR);
-    Wire1.write(0x02);
-    if (Wire1.endTransmission(false) != 0) return 0;
-    if (Wire1.requestFrom(RTC_ADDR, (uint8_t)7) != 7) return 0;
-    uint8_t r[7];
-    for (uint8_t i = 0; i < 7; i++) r[i] = Wire1.read();
-    if (r[0] & 0x80) { if (lost) *lost = true; return 0; }   // VL: the backup ran out
-    const int y = 2000 + bcd2bin(r[6]);
-    const unsigned mo = bcd2bin(r[5] & 0x1F), d = bcd2bin(r[3] & 0x3F);
-    if (mo < 1 || mo > 12 || d < 1 || d > 31) return 0;
-    const uint32_t days = (uint32_t)daysFromCivil(y, mo, d);
-    return days * 86400u + bcd2bin(r[2] & 0x3F) * 3600u + bcd2bin(r[1] & 0x7F) * 60u + bcd2bin(r[0] & 0x7F);
-}
-
-// At boot: the chip's time, when it has one worth believing, sets the clock
-// as a real answer -- trusted, not the ten-minute note's guess.
-static void twatchRtcBegin() {
-    bool lost = false, foreign = false;
-    const uint32_t t = rtcRead(&lost, &foreign);
-    if (t) {
-        s_rtcLoading = true;
-        const bool ok = Clock::setEpoch(t) && Clock::isSet();
-        s_rtcLoading = false;
-        Serial.printf("[rtc] clock chip says %lu: %s\n", (unsigned long)t, ok ? "clock set from it" : "not believable");
-    } else {
-        Serial.printf("[rtc] clock chip has no time (%s)\n", lost ? "backup ran out" : foreign ? "not set by SquachWatch" : "not answering");
-    }
-    Clock::onSet(rtcWrite);
-    // A clock that already knew the time (kept by the ESP32 across a soft
-    // reset) goes to a chip that did not.
-    if (!t && Clock::trusted()) rtcWrite(Clock::nowEpoch());
-}
-
-// The WATCH page's BATTERY row: "81% 4.12V", or "CHG 81%" on the cable.
-void twatchBatteryLine(char* out, size_t n) {
-    if (!s_pmuOk) { snprintf(out, n, "?"); return; }
-    static uint32_t at = 0;
-    static char     line[16] = "";
-    const uint32_t now = millis();
-    if (!line[0] || now - at >= 2000) {   // two I2C reads, not one per frame
-        at = now;
-        const int pct = s_pmu.getBatteryPercent();
-        if (s_pmu.isCharging()) snprintf(line, sizeof line, "CHG %d%%", pct);
-        else snprintf(line, sizeof line, "%d%% %u.%02uV", pct, (unsigned)(s_pmu.getBattVoltage() / 1000),
-                      (unsigned)(s_pmu.getBattVoltage() % 1000 / 10));
-    }
-    snprintf(out, n, "%s", line);
-}
-
-// The chip's own temperature sensor, read at most every two seconds: the
-// settings row asks every frame, and each read starts and stops the sensor.
-int twatchChipC() {
-    static uint32_t at = 0;
-    static int c = 0;
-    const uint32_t now = millis();
-    if (!at || now - at >= 2000) { at = now ? now : 1; c = (int)lroundf(temperatureRead()); }
-    return c;
-}
-
-// CLOCK CHECK: the ESP32's 40 MHz crystal against the clock chip's own
-// 32 kHz one. Both radios tune off the ESP32's crystal, and so does micros();
-// a crystal that started up off-frequency would leave the CPU, the screen and
-// USB working and both radios deaf -- and only a power cut would restart it,
-// which is exactly how the deaf spells behave (2026-09-24). The clock chip's
-// seconds tick is the yardstick: catch one tick, count XTAL_SECS of them,
-// catch the last, and compare with micros(). Catching a tick means polling
-// the chip for up to a second, so the screen stalls twice, briefly.
-// Healthy is within about +-30 ppm (both crystals together); the radios need
-// the ESP32's within about +-25 ppm of true.
-static const uint32_t XTAL_SECS = 60;
-static uint8_t  s_xtalState = 0;          // 0 never run, 1 counting, 2 done, 3 failed
-static uint32_t s_xtalT0 = 0, s_xtalStartMs = 0;
-static uint8_t  s_xtalSec0 = 0;
-static int32_t  s_xtalPpm = 0;
-static int      s_xtalChipC = 0;
-// Polls the clock chip's seconds until they change; the micros() of the
-// change and the new second. False if the chip did not answer or never ticked.
-static bool rtcTick(uint32_t& atUs, uint8_t& sec) {
-    auto readSec = [](uint8_t& s) -> bool {
-        Wire1.beginTransmission(RTC_ADDR);
-        Wire1.write(0x02);
-        if (Wire1.endTransmission(false) != 0) return false;
-        if (Wire1.requestFrom(RTC_ADDR, (uint8_t)1) != 1) return false;
-        s = bcd2bin(Wire1.read() & 0x7F);
-        return true;
-    };
-    uint8_t first;
-    if (!readSec(first)) return false;
-    const uint32_t t0 = millis();
-    while (millis() - t0 < 1500) {
-        uint8_t s;
-        if (!readSec(s)) return false;
-        if (s != first) { atUs = micros(); sec = s; return true; }
-    }
-    return false;
-}
-static void twatchXtalStart() {
-    if (s_xtalState == 1) return;
-    if (!s_pmuOk || !rtcTick(s_xtalT0, s_xtalSec0)) {
-        s_xtalState = 3;
-        Serial.println("[xtal] the clock chip did not tick; no check");
-        return;
-    }
-    s_xtalState = 1;
-    s_xtalStartMs = millis();
-    Serial.printf("[xtal] counting %lu clock-chip seconds against micros()...\n", (unsigned long)XTAL_SECS);
-}
-static void twatchXtalTick(uint32_t now) {
-    if (s_xtalState != 1 || now - s_xtalStartMs < (XTAL_SECS - 1) * 1000u) return;
-    uint32_t t1; uint8_t s1;
-    if (!rtcTick(t1, s1)) { s_xtalState = 3; Serial.println("[xtal] lost the clock chip's tick"); return; }
-    const uint32_t us = t1 - s_xtalT0;
-    const uint32_t n  = (us + 500000u) / 1000000u;   // whole seconds the chip counted
-    if (!n || (s_xtalSec0 + n) % 60 != s1) { s_xtalState = 3; Serial.println("[xtal] the seconds did not add up"); return; }
-    s_xtalPpm   = (int32_t)(((int64_t)us - (int64_t)n * 1000000) * 1000000 / ((int64_t)n * 1000000));
-    s_xtalChipC = twatchChipC();
-    s_xtalState = 2;
-    Serial.printf("[xtal] %lu s by the clock chip took %lu us by the ESP32: %+ld ppm (chip %d C; radios heard %lu adverts, %lu frames since boot)\n",
-                  (unsigned long)n, (unsigned long)us, (long)s_xtalPpm, s_xtalChipC,
-                  (unsigned long)advertsSeen(), (unsigned long)wifiFramesSeen());
-}
-
-// DC1 -- the ESP32 and its radio -- in the chip's automatic PWM/PFM. The
-// STEADY POWER row that forced PWM was a test for the deaf radios, which
-// were never the supply's fault (the slim WiFi re-init, fixed in v1.21.0);
-// set at boot so a watch that saved STEADY ON goes back to automatic.
-// The charge current. 200 mA suits the plain T-Watch S3's small cell; the
-// S3 Plus has about twice the cell and took 3 h 18 min from empty to 94% at
-// 200 mA while running (2026-09-29). 400 mA on a watch known to be a Plus.
-static void twatchApplyCharge() {
-    if (!s_pmuOk) return;
-    s_pmu.setChargerConstantCurr(Settings::watchPlus() ? XPOWERS_AXP2101_CHG_CUR_400MA : XPOWERS_AXP2101_CHG_CUR_200MA);
-    Serial.printf("[pmu] charge %s\n", Settings::watchPlus() ? "400 mA (S3 Plus)" : "200 mA");
-}
-
-static void twatchApplySteady() {
-    if (!s_pmuOk) return;
-    s_pmu.settDC1WorkModeToPwm(0);
-}
-
-static void twatchBatterySample(uint8_t why) {
-    if (!s_pmuOk) return;
-    BlackBox::BattRecord r;
-    memset(&r, 0, sizeof r);
-    r.mv       = s_pmu.getBattVoltage();
-    r.pct      = (uint8_t)s_pmu.getBatteryPercent();
-    r.why      = why;
-    r.epoch    = Clock::trusted() ? Clock::nowEpoch() : 0;
-    r.upSec    = millis() / 1000u;
-    r.cpuMhz10 = (uint8_t)(getCpuFrequencyMhz() / 10);
-    if (s_pmu.isVbusIn())   r.flags |= BlackBox::BATT_USB;
-    if (s_pmu.isCharging()) r.flags |= BlackBox::BATT_CHARGING;
-    if (!s_panelAsleep)     r.flags |= BlackBox::BATT_SCREEN_ON;
-    if (!s_radiosResting)   r.flags |= BlackBox::BATT_RADIOS_ON;
-    r.chipC   = (int8_t)twatchChipC();
-    r.steady  = 0;
-    r.adverts = advertsSeen();
-    r.frames  = wifiFramesSeen();
-    BlackBox::noteBattery(r);
-    static const char* const WHY[] = { "timer", "boot", "usb", "screen", "radio reset", "self-heal" };
-    Serial.printf("[batt] %u mV  %u%%  %s%s  screen %s  cpu %u MHz  up %lu s  chip %d C  heard %lu/%lu  (%s)\n",
-                  (unsigned)r.mv, (unsigned)r.pct, (r.flags & BlackBox::BATT_USB) ? "on USB" : "on battery",
-                  (r.flags & BlackBox::BATT_CHARGING) ? ", charging" : "", s_panelAsleep ? "off" : "on",
-                  (unsigned)getCpuFrequencyMhz(), (unsigned long)r.upSec, (int)r.chipC,
-                  (unsigned long)r.adverts, (unsigned long)r.frames, WHY[why < 6 ? why : 0]);
-}
-
-// Every ten minutes, at boot, and whenever the cable or the screen changes
-// state: the points where the slope of the curve changes.
-static void twatchBatteryTick(uint32_t now) {
-    if (!s_pmuOk) return;
-    static uint32_t lastAt = 0;
-    static bool first = true, wasUsb = false, wasAsleep = false;
-    if (first) {
-        first = false; lastAt = now;
-        wasUsb = s_pmu.isVbusIn(); wasAsleep = s_panelAsleep;
-        twatchBatterySample(BlackBox::BATT_WHY_BOOT);
-        return;
-    }
-    if (wasAsleep != s_panelAsleep) {
-        wasAsleep = s_panelAsleep; lastAt = now;
-        twatchBatterySample(BlackBox::BATT_WHY_SCREEN);
-        return;
-    }
-    if (now - lastAt < 600000u) return;
-    lastAt = now;
-    const bool usb = s_pmu.isVbusIn();   // one I2C read, ten minutes apart
-    if (usb != wasUsb) { wasUsb = usb; twatchBatterySample(BlackBox::BATT_WHY_USB); return; }
-    twatchBatterySample(BlackBox::BATT_WHY_TIMER);
-}
-
-// The radio duty cycle. The radios are on the cable, on with the screen
-// (someone is looking), on through an alert, and on whenever anything else
-// has the radio (an update, a raw scan). Otherwise they run for the on part
-// of the cycle and rest for the rest of it. What "rest" means is the
-// engine's business: see DetectionEngine::restRadios().
-static void twatchRadioTick(uint32_t now) {
-    static uint32_t phaseAt = 0, usbAt = 0;
-    static bool     usb = true;
-    // A rest cut short by a Bluetooth arrival is paid back on the next one,
-    // so the WiFi on-time is the same as the plain cycle: the window just
-    // lands when something turned up instead of on the clock.
-    static uint32_t owedMs = 0, arrivalsAt = 0;
-    bleArrivalsRoll(now);
-    if (now - usbAt >= 2000) { usbAt = now; usb = s_pmuOk && s_pmu.isVbusIn(); s_onUsb = usb; }
-    // BLE LISTEN, on battery; the cable pays for the full 75 either way.
-    setScanWindowBase(usb ? 75 : Settings::bleListen());
-    // RADIO TEST on the console forces BLE+5/30 whatever the settings say.
-    const uint8_t duty = g_consoleRadioTest ? 3 : Settings::radioDuty();
-    // Only a device you asked to WATCH holds the radios awake. Every alert
-    // did, and a room with a Ring camera and a Flipper in it alerts every
-    // few seconds, so WiFi never got a rest at home.
-    const bool alerting = (state == AppState::WATCH_ALERT);
-    const bool wantOn = duty == 0 || (!g_consoleRadioTest && (usb || !s_panelAsleep)) || alerting ||
-                        state == AppState::UPDATE || OtaWifi::state() != OtaWifi::State::OFF;
-    uint32_t onMs = 5000, offMs = 25000;
-    if (duty == 2) { onMs = 10000; offMs = 50000; }
-    if (wantOn) {
-        static uint32_t saidAt = 0;
-        if (g_consoleRadioTest && now - saidAt >= 10000) {
-            saidAt = now;
-            Serial.printf("[radio] held awake: duty %u, alerting %d, app state %u, update state %u\n",
-                          (unsigned)duty, (int)alerting, (unsigned)state, (unsigned)OtaWifi::state());
-        }
-        if (s_radiosResting) { engine.wakeRadios(); s_radiosResting = false; Serial.println("[radio] awake"); }
-        phaseAt = now;
-        return;
-    }
-    if (!s_radiosResting) {
-        if (now - phaseAt < onMs) return;
-        if (engine.restRadios(duty != 3)) {
-            s_radiosResting = true;
-            arrivalsAt = bleArrivals();
-            Serial.printf("[radio] resting: %s\n", duty == 3 ? (owedMs ? "WiFi off, BLE on, paying back an early window" : "WiFi off, BLE on") : "WiFi and BLE off");
-        }
-        phaseAt = now;   // either way: a refused rest tries again after another on-window
-    } else {
-        const uint32_t rested = now - phaseAt;
-        // Only with Bluetooth listening, only once a rest has settled, and
-        // not on a rest that is paying back the last early one.
-        const bool arrival = duty == 3 && !owedMs && rested >= 3000 && rested < offMs &&
-                             bleArrivals() != arrivalsAt;
-        if (arrival || rested >= offMs + owedMs) {
-            owedMs = arrival ? offMs - rested : 0;
-            engine.wakeRadios(); s_radiosResting = false; phaseAt = now;
-            if (arrival) Serial.printf("[radio] awake early: a new Bluetooth device, %lu s into the rest\n", (unsigned long)(rested / 1000));
-            else         Serial.println("[radio] awake (timed)");
-        }
-    }
-}
-
-// The radio self-heal. The watch's radios have gone deaf more than once --
-// started, configured, hearing nothing -- sometimes both, sometimes only
-// Bluetooth (2026-09-24 at work: WiFi came back by itself, Bluetooth only
-// after the crown switched the watch off and on). Bluetooth is the tell: it
-// listens nearly all the time, and there is hardly a place with no adverts in
-// it. So: two minutes of Bluetooth listening without one advert, at any point
-// in the day and not just after boot, and the watch restarts itself.
-//
-// Never the software kind (ESP.restart): parts of the chip, the radio's
-// analog side among them, stay powered through that, and every cure seen so
-// far was deeper -- the cable reset of an esptool MAC check (a whole-chip
-// reset) and the crown's off-and-on. Firmware cannot reach either. The PMU's
-// own "restart the SoC" (reg 0x10 bit 1) was tried first and HUNG the watch
-// on the wrist until a crown hard-off (2026-09-24), so it is out. What is
-// left is a second of deep sleep: the radio, the CPU and the digital core are
-// powered down, and the chip's RTC timer, which needs nothing from the PMU,
-// wakes it into a full boot. At most HEAL_MAX in a row: the count clears the
-// moment an advert arrives, so a field with no radios in it costs two
-// restarts and then waits, rather than looping.
-static const uint8_t  HEAL_MAX       = 2;
-static const uint32_t HEAL_DEAF_MS   = 120000;   // of Bluetooth listening, not of clock
-// Power the chip down for a second and let its own timer bring it back into
-// a full boot, leaving `count` in RTC memory (which deep sleep keeps) for the
-// next boot to read. The black box gets a battery line first, with why, so a
-// morning read-out shows every one of these.
-static void twatchPowerCycle(uint8_t count, uint8_t why) {
-    twatchBatterySample(why);
-    Serial.println("[heal] a second of deep sleep, then a full boot");
-    serialFlush();
-    g_healWord = HEAL_MAGIC | (uint32_t)count;
-    engine.restRadios(true);   // WiFi stopped and Bluetooth's scan asked to stop, as a rest does
-    delay(100);
-    esp_sleep_enable_timer_wakeup(1000000ULL);
-    esp_deep_sleep_start();
-}
-
-static bool bleShouldHear() {
-    // Resting with Bluetooth off (the 5/30 and 10/60 duties), a raw scan, an
-    // update: none of those are the radio's fault.
-    if (s_radiosResting && Settings::radioDuty() != 3) return false;
-    if (onRawScanScreen() || state == AppState::UPDATE || OtaWifi::state() != OtaWifi::State::OFF) return false;
-    return true;
-}
-static void twatchRadioHealTick(uint32_t now) {
-    static bool     said = false, gaveUp = false;
-    static uint32_t lastAdv = 0, lastAt = 0, deafMs = 0;
-    if (!said) {
-        said = true;
-        lastAt = now; lastAdv = advertsSeen();
-        if (s_healCount) Serial.printf("[heal] this boot is self-heal restart %u of %u\n", (unsigned)s_healCount, (unsigned)HEAL_MAX);
-    }
-    const bool forced = g_consoleHeal;
-    g_consoleHeal = false;
-    if (!forced) {
-        if (now - lastAt < 1000) return;
-        const uint32_t adv = advertsSeen();
-        if (adv != lastAdv) {
-            lastAdv = adv; deafMs = 0; gaveUp = false;
-            if (s_healCount) {
-                Serial.printf("[heal] hearing again after %u self-heal restart(s)\n", (unsigned)s_healCount);
-                s_healCount = 0;   // the next deaf spell starts from one
-            }
-        } else if (bleShouldHear()) {
-            deafMs += now - lastAt;
-        }
-        lastAt = now;
-        if (deafMs < HEAL_DEAF_MS) return;
-        deafMs = 0;
-    }
-    if (s_healCount >= HEAL_MAX) {
-        if (!gaveUp) Serial.printf("[heal] still deaf after %u restarts; waiting until it hears something\n", (unsigned)s_healCount);
-        gaveUp = true;
-        return;
-    }
-    const uint8_t next = (uint8_t)(s_healCount + 1);
-    Serial.printf("[heal] Bluetooth deaf: no adverts in %lu s of listening (%lu WiFi frames since boot)%s; restarting (%u of %u)\n",
-                  (unsigned long)(HEAL_DEAF_MS / 1000), (unsigned long)wifiFramesSeen(), forced ? " (bench test)" : "",
-                  (unsigned)next, (unsigned)HEAL_MAX);
-    twatchPowerCycle(next, BlackBox::BATT_WHY_HEAL);
-}
-
-// Polled ten times a second: one I2C read of the PMU's interrupt flags. A
-// short press of the crown counts as a touch, which is what wakes the screen
-// and holds off the timeout; nothing else is bound to it yet.
-static void twatchCrownTick(uint32_t now) {
-    static uint32_t at = 0;
-    if (!s_pmuOk || now - at < 100) return;
-    at = now;
-    // The haptic driver back to standby once the longest pattern (three
-    // buzzes, about 1.5 s) is surely over.
-    if (s_drvAwakeAt && now - s_drvAwakeAt > 3000) { s_drvAwakeAt = 0; drvWrite(0x01, 0x40); }
-    s_pmu.getIrqStatus();
-    if (s_pmu.isPekeyShortPressIrq()) {
-        if (!s_screenDimmed) {
-            s_crownDark = true;
-            s_crownDarkAt = now;
-            s_crownLitUntil = 0;
-            Serial.println("[crown] screen off");
-        } else {
-            s_crownDark = false;
-            lastTouch = now;
-            Serial.println("[crown] screen on");
-        }
-    }
-    s_pmu.clearIrqStatus();
-}
-#endif
 
 // Runtime UART speed -- set per-board in platformio.ini (-DSERIAL_BAUD=...)
 // for hardware confirmed to hold a faster rate cleanly; boards without
@@ -2781,6 +1865,7 @@ static void printBootBanner() {
         case ESP_RST_WDT:
         case ESP_RST_BROWNOUT:
             Serial.println("*** That was not a clean boot.");
+            Serial.printf("*** Boots in a row under 90 s, any reason: %u\n", (unsigned)g_shortBoots);
             Serial.println("*** The crash is saved in flash. To read it out:");
             Serial.println("***   esptool read_flash 0x3F0000 0x10000 core.bin");
             Serial.println("***   espcoredump.py info_corefile -c core.bin firmware.elf");
@@ -2801,27 +1886,14 @@ static void printBootBanner() {
 }
 
 // ---- Arduino setup / loop ----
-#if defined(TWATCH_S3)
-static void wardriveBegin();
-#endif
 void setup() {
     // Before anything else can allocate: the breadcrumb has to be read out
     // while it is still the previous life's, not this one's.
     crashReportInit();
     Serial.begin(SERIAL_BAUD);
-#if defined(SQW_S3)
-    // Native USB: with nothing reading the port, every print would otherwise
-    // wait its full timeout for a host, and after the chatty first-boot
-    // calibration the loop crawled so slowly the screen looked frozen black.
-    // Drop the bytes instead when nobody is listening.
-    Serial.setTxTimeoutMs(0);
-#endif
     delay(200);
     Serial.println();
     printBootBanner();
-#if defined(TWATCH_S3)
-    twatchPowerUp();
-#endif
 #if defined(CYD35)
     // One-time diagnostic: is PSRAM actually present on this unit? The
     // "no PSRAM" conclusion driving the no-full-framebuffer tradeoff
@@ -2846,40 +1918,19 @@ void setup() {
 // Not on AWOK (TOUCH_CS there) and not on either RL Phantom, where GPIO21 is
 // the capacitive controller's INTERRUPT line. Driving it high at boot is the
 // same mistake as the LEDC attach further down, just earlier.
-// ... and not on the CrowPanel 7, where GPIO21 is the panel's BLUE-0 data
-// line. Driving it high before the panel driver claims it is a stripe down the
-// picture at best.
-#if !defined(AWOK) && !defined(RLPHANTOM) && !defined(RLPHANTOM_R) && !defined(SQW_S3) && !defined(CROWPANEL7) && !defined(CYD32C)
+#if defined(LCDWIKI_ES3C28P)
+    pinMode(BL_PIN_LCDWIKI, OUTPUT);
+    digitalWrite(BL_PIN_LCDWIKI, HIGH);
+#elif !defined(AWOK) && !defined(RLPHANTOM) && !defined(RLPHANTOM_R)
     pinMode(21, OUTPUT); digitalWrite(21, HIGH);
-#endif
-#if defined(SQW_S3)
-    // GPIO27 and GPIO32 are the S3's PSRAM lines: touching either hangs the
-    // chip until the watchdog reboots it. Both S3 boards' backlight is GPIO45.
-    pinMode(BL_PIN_S3, OUTPUT); digitalWrite(BL_PIN_S3, HIGH);
-#elif defined(CROWPANEL7)
-    // Nothing at all. This board's backlight is not a GPIO -- it is an I2C
-    // command to the helper MCU, sent once Wire is up. GPIO27/32 are the same
-    // OPI PSRAM lines the watch avoids, and every other candidate here is an
-    // RGB data line.
+    pinMode(27, OUTPUT); digitalWrite(27, HIGH);
+    pinMode(32, OUTPUT); digitalWrite(32, HIGH);
 #else
     pinMode(27, OUTPUT); digitalWrite(27, HIGH);
-#if !defined(FREENOVE32) && !defined(CYD32C)   // not a spare pin on the Freenove, and the 2432S032C's touch SCL; both light 27 alone
-    pinMode(32, OUTPUT); digitalWrite(32, HIGH);  // AWOK's real BL pin; unused GPIO on the other two boards
-#endif
+    pinMode(32, OUTPUT); digitalWrite(32, HIGH);
 #endif
 
     tft.init();
-
-#if defined(CROWPANEL7_PANELTEST)
-    // Bring-up only: prove the panel before anything else can be blamed for
-    // it. Colour bars in a known order (so a red/blue swap in the pin map is
-    // visible rather than merely wrong), a one-pixel grid (so a pixel clock
-    // that is running away shows as a moving moire instead of "looks fine"),
-    // and the measured frame period -- quiet, then with a flash write every
-    // 20 ms in alternate three-second phases, which is what flash costs the
-    // picture in numbers.
-    crowPanelTest();
-#endif
 
     // Load persisted settings before the first real pixel is drawn, so
     // boot itself already reflects the saved theme/invert choice
@@ -2888,13 +1939,6 @@ void setup() {
     // saved rotation instead of always starting from the board default.
     Settings::load();
     Clock::begin();   // after Settings: the zone is applied there, the history here
-#if defined(TWATCH_S3)
-    twatchRtcBegin();      // after Clock::begin(): a real time beats the note's guess
-    twatchHapticBegin();
-    twatchMotionBegin();
-    twatchApplySteady();   // after Settings::load()
-    twatchApplyCharge();
-#endif
     Security::begin();
     // Which version lives in this slot, and whether this boot is a fresh
     // update on probation or the aftermath of one that was rolled back.
@@ -2934,25 +1978,18 @@ void setup() {
 // TOUCH_CS on AWOK, and the capacitive controller's INTERRUPT line on the RL
 // Phantom. Driving a 5 kHz PWM onto either is the kind of fault that looks
 // like dead touch, which is exactly how it presented on the Phantom.
-#if defined(CROWPANEL7)
-    // No LEDC at all: the backlight is an I2C command byte. Claiming channels
-    // here would only take them away from something that has a pin.
-#elif defined(SQW_S3)
-    // One backlight, GPIO45, on the first channel. The CYD pins below are
-    // flash/PSRAM lines and the power chip's interrupt on an S3.
-    ledcSetup(BL_CH_ORIG, 5000, 8);
-    ledcAttachPin(BL_PIN_S3, BL_CH_ORIG);
+#if defined(LCDWIKI_ES3C28P)
+    ledcSetup(BL_CH_LCDWIKI, 5000, 8);
+    ledcAttachPin(BL_PIN_LCDWIKI, BL_CH_LCDWIKI);
 #else
-#if !defined(AWOK) && !defined(RLPHANTOM) && !defined(RLPHANTOM_R) && !defined(CYD32C)
+#if !defined(AWOK) && !defined(RLPHANTOM) && !defined(RLPHANTOM_R)
     ledcSetup(BL_CH_ORIG, 5000, 8);
     ledcAttachPin(BL_PIN_ORIG, BL_CH_ORIG);
 #endif
     ledcSetup(BL_CH_CAP, 5000, 8);
     ledcAttachPin(BL_PIN_CAP, BL_CH_CAP);
-#if !defined(FREENOVE32) && !defined(CYD32C)   // see the pinMode(32) above; a channel with no pin is harmless to write
     ledcSetup(BL_CH_AWOK, 5000, 8);
     ledcAttachPin(BL_PIN_AWOK, BL_CH_AWOK);
-#endif
 #endif
     applyBrightness();
     // A saved core clock has to be restored here too, or the setting silently
@@ -2980,8 +2017,8 @@ void setup() {
         // radio start below: WiFi's RF calibration plus a full backlight is
         // more than a weak USB port holds, and the first run of this check
         // browned the Phantom out into a second boot.
-#if defined(CROWPANEL7)
-        CrowBL::set(24);
+#if defined(LCDWIKI_ES3C28P)
+        ledcWrite(BL_CH_LCDWIKI, 24);
 #else
         ledcWrite(BL_CH_ORIG, 24);
         ledcWrite(BL_CH_CAP,  24);
@@ -3025,41 +2062,13 @@ void setup() {
     // 16-bit — the full 16-bit buffer didn't fit in the available
     // contiguous heap on this board.
     frame.setColorDepth(8);
-#if defined(SQW_S3) || (defined(CROWPANEL7) && CROWPANEL_FRAME_INTERNAL)
-    // 57.6 KB fits in internal RAM with room to spare (75 KB at 320x240), and a sprite in
-    // PSRAM pushes slower and cannot go by DMA. Keep it inside.
-    //
-    // CrowPanel: not an economy but the fix for a twitching picture -- the
-    // panel's DMA reads its framebuffer from PSRAM, and the UI's scattered
-    // writes into a PSRAM sprite starve it (see crowpanel7_board.h).
-    frame.setAttribute(PSRAM_ENABLE, false);
-#endif
-#if defined(CROWPANEL7) && CROWPANEL_FRAME_INTERNAL
-    // PSRAM_ENABLE=false only makes TFT_eSPI call plain calloc() -- and on a
-    // PSRAM-enabled Arduino core plain calloc() of anything over
-    // CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL (4 KB here) is served from PSRAM
-    // regardless. Measured: the frame landed at 0x3D8BC308, which is PSRAM.
-    // Raise that threshold for this one allocation and put it straight back.
-    heap_caps_malloc_extmem_enable(1u << 20);
-#endif
-    const bool frameOk = frame.createSprite(tft.width(), tft.height());
-#if defined(CROWPANEL7) && CROWPANEL_FRAME_INTERNAL
-    heap_caps_malloc_extmem_enable(CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL);
-    // Say where it landed: internal SRAM sits at 0x3FC8xxxx on the S3, PSRAM
-    // at 0x3C000000..0x3DFFFFFF, and a frame in the wrong one is the twitch.
-    if (frameOk) {
-        const uintptr_t a = (uintptr_t)frame.buf();
-        Serial.printf("[boot] frame %ux%u at %p (%s)\n", (unsigned)frame.bufW(), (unsigned)frame.bufH(), (void*)a,
-                      (a >= 0x3C000000u && a < 0x3E000000u) ? "PSRAM" : "internal");
-    }
-#endif
-    if (!frameOk) {
+    if (!frame.createSprite(tft.width(), tft.height())) {
         Serial.println("ERROR: frame buffer allocation failed (low memory)");
 #if HAVE_NVS_ERASE
         if (bootCheckRan) {
             // The check's leftovers took the block. Once more, without it.
             g_bootCheckSkip = CHKSKIP_MAGIC;
-            serialFlush();
+            Serial.flush();
             delay(20);
             esp_restart();
         }
@@ -3074,7 +2083,12 @@ void setup() {
     // and can go anywhere after the display is up.
     FramePush::begin();
 
-#if defined(CYD35)
+#if defined(LCDWIKI_ES3C28P)
+    CapTouch::begin(CAP_SDA, CAP_SCL, CAP_RST);
+    usingCapTouch = CapTouch::probe();
+    Serial.printf("LCDWiki ES3C28P FT6336G touch: %s\n",
+                  usingCapTouch ? "detected" : "NOT detected");
+#elif defined(CYD35)
     // The standalone XPT2046_Touchscreen library (own SPIClass, own
     // IRQ pin) produced constant garbage reads and a free-running IRQ
     // here -- not a wrong-pin problem, a second SPI master fighting
@@ -3096,43 +2110,6 @@ void setup() {
     // rotation maths on them, so touch follows the screen round.
     usingCapTouch = false;
     Serial.println("RL Phantom (resistive) -- XPT2046 on shared bus, raw reads + rotation maths.");
-#elif defined(CROWPANEL7)
-    // The GT911, on the same I2C bus as the backlight helper -- which is why
-    // there is no Wire.end() anywhere on this path. It will not answer until
-    // the helper has been told to wake it and its INT line pulsed low, so
-    // Gt911::begin() does that dance before it gives up.
-    usingCapTouch = Gt911::begin();
-    Serial.println(usingCapTouch ? "CrowPanel 7 -- GT911 capacitive touch answered."
-                                 : "CrowPanel 7 -- GT911 did not answer; no touch.");
-    // Here and not with StatusLight::begin(): this is the first point the
-    // I2C bus is up and the helper has been spoken to. Sends OFF only, for a
-    // buzzer a crash may have left sounding -- the helper keeps its state
-    // across our reset. Not a boot beep.
-    CrowBuzzer::begin();
-#elif defined(CYD32C)
-    // The GT911, on the CYD's capacitive I2C pins. Raw panel pixels in the
-    // panel's own portrait frame, so the five-target calibration maps them
-    // onto the screen like any other capacitive CYD.
-    usingCapTouch = Gt911::begin();
-    Serial.println(usingCapTouch ? "ESP32-2432S032C -- GT911 capacitive touch answered."
-                                 : "ESP32-2432S032C -- GT911 did not answer; no touch.");
-#elif defined(TWATCH_S3)
-    // The T-Watch's FT6336, on I2C SDA 39 / SCL 40 at 0x38. No reset line;
-    // the AXP2101 powers it (ALDO3) in twatchPowerUp(), before this runs.
-    CapTouch::begin(39, 40, -1, 0x38);
-    usingCapTouch = CapTouch::probe();
-    Serial.println(usingCapTouch ? "T-Watch S3 -- FT6336 capacitive touch answered."
-                                 : "T-Watch S3 -- FT6336 did not answer; no touch.");
-#elif defined(FREENOVE_S3)
-    // The Freenove S3 2.8"'s FT6336, on I2C SDA 16 / SCL 15 at 0x38, reset on
-    // GPIO18 (active low). The ES8311 codec shares the bus at 0x18. FNK0104A
-    // is the same board with no touch panel: nothing answers, and the screen
-    // runs without touch rather than on a guessed fallback.
-    CapTouch::begin(16, 15, 18, 0x38);
-    usingCapTouch = CapTouch::probe();
-    Serial.println(usingCapTouch ? "Freenove S3 -- FT6336 capacitive touch answered."
-                                 : "Freenove S3 -- FT6336 did not answer; no touch (FNK0104A?).");
-    { char b[16]; boardBatteryLine(b, sizeof b); Serial.printf("[batt] %s (raw GPIO9 %u mV)\n", b, (unsigned)analogReadMilliVolts(9)); }
 #elif defined(TOUCH_ON_DISPLAY_BUS)
     // AWOK's XPT2046 sits on the display's own shared VSPI bus (TOUCH_CS=21,
     // already armed by TFT_eSPI itself once awok_user_setup.h's #define
@@ -3178,13 +2155,7 @@ void setup() {
         uint32_t windowStart = millis();
         while (millis() - windowStart < 1200) {
             int16_t a, b;
-#if defined(CROWPANEL7) || defined(CYD32C)
-            // The GT911 is neither of the two below; the two-way dispatch
-            // polled a capacitive controller that is not on this bus.
-            bool down = readTouchRaw(a, b);
-#else
             bool down = usingCapTouch ? rawReadCap(a, b) : rawReadResistive(a, b);
-#endif
             if (down) {
                 if (holdStart == 0) holdStart = millis();
                 else if (millis() - holdStart > 800) {
@@ -3227,33 +2198,16 @@ void setup() {
     // injected against the compiled-in ranges -- a calibration screen would
     // just sit there waiting for a finger.
     initTouchFit();
-#if defined(ESP32) && !defined(CROWPANEL7)
+#if defined(ESP32)
     if (s_calSource != CalSource::SAVED) {
         Serial.println("Touch: no five-target calibration yet -- running it now.");
         runTouchCalibration();
     }
 #endif
-#if defined(CROWPANEL7)
-    // Never on first boot here. The GT911 reports panel pixels, so the
-    // compiled-in fit is already the identity and there is nothing to
-    // calibrate -- making someone tap five targets would only replace an
-    // exact mapping with a hand-aimed one. SETTINGS can still run it.
-    Serial.println("Touch: GT911 reports panel pixels; no calibration needed.");
-#endif
 
     // Seed the PRNG so the digital rain starts in a fresh-looking state
-    // on every boot.
-#if defined(SQW_S3) || defined(CROWPANEL7)
-    // GPIO34 is not an ADC pin on an S3 (it is an octal PSRAM line on these
-    // boards, the CrowPanel's N16R8 module included): analogRead() refuses
-    // it and the seed was a constant. The hardware RNG instead -- before WiFi
-    // starts it is running on the bootloader's entropy rather than radio
-    // noise, still no constant.
-    randomSeed(esp_random());
-#else
-    // Analog read on a floating pin is plenty.
+    // on every boot. Analog read on a floating pin is plenty.
     randomSeed(analogRead(34));
-#endif
 
     // The backlight goes down while the radios come up, and back to your
     // setting once they are running.
@@ -3265,8 +2219,8 @@ void setup() {
     // browned out at exactly this point on every boot -- three seconds a
     // cycle, forever -- off any supply short of a powered hub. The backlight
     // is the one large load that nobody misses for a second at boot.
-#if defined(CROWPANEL7)
-    CrowBL::set(24);
+#if defined(LCDWIKI_ES3C28P)
+    ledcWrite(BL_CH_LCDWIKI, 24);
 #else
     ledcWrite(BL_CH_ORIG, 24);
     ledcWrite(BL_CH_CAP,  24);
@@ -3299,41 +2253,10 @@ void setup() {
         BlackBox::noteBoot(br);
     }
 
-#if defined(TWATCH_S3)
-    // The wardrive log, and its GPS if wardriving was left on.
-    wardriveBegin();
-#endif
-
-#if defined(TWATCH_S3)
-    // What the watch is like at the moment the radios start. A boot that
-    // ran the touch calibration first hears the room; a plain boot comes up
-    // deaf. Logged so the two kinds of boot can be compared line by line.
-    {
-        nvs_stats_t st = {};
-        nvs_get_stats(NULL, &st);
-        snprintf(g_bootRadioLine, sizeof g_bootRadioLine,
-                 "radios started at %lu ms; chip %.1f C; heap %lu; nvs used %u free %u; calibration %s; self-heal restart %u",
-                 (unsigned long)millis(), temperatureRead(), (unsigned long)ESP.getFreeHeap(),
-                 (unsigned)st.used_entries, (unsigned)st.free_entries,
-                 s_calRanThisBoot ? "RAN this boot" : "skipped", (unsigned)s_healCount);
-        Serial.printf("[boot] %s\n", g_bootRadioLine);
-    }
-#endif
     engine.init();
-#if SQUACH_LORA
-    // The LoRa radio, after WiFi and Bluetooth: its own task and its own bus.
-    // Receive only. Console LORA for what it hears.
-    Lora::begin();
-#endif
-#if defined(CROWPANEL7_PERIPH_PROBE)
-    crowPeriphProbe();
-#endif
     // After the engine: the card leans on the lifetime counts to pick which
     // type sits out, and those are read in init().
     Bingo::begin(engine);
-    Dex::begin();
-    Regulars::begin();
-    Squachy::setIdleProvider([]() { return Notices::idleLine(engine); });
 #if SQUACH_MESH
     // After the radio is up and before anything can ask whether messages are
     // ready: this is where the crypto self-test runs, on the real cipher,
@@ -3433,16 +2356,12 @@ static void runPrimBench() {
 // tell whether a change to that clock did what the arithmetic claims.
 static uint32_t s_pushUsAvg  = 0;
 static uint32_t s_frameUsAvg = 0;
-static uint32_t s_loopsSinceSay = 0;
 static uint32_t s_pushAccumUs = 0;   // summed within a frame: cyd35 pushes twice
 #if defined(CYD35)
 static uint32_t s_bandUs[2] = {0, 0};      // measurement: the 3.5"'s two draw passes
 #endif
 
 static inline void pushFrame(int x, int y) {
-#if defined(TWATCH_S3)
-    if (s_panelAsleep) return;   // nothing to show it to; see applyBrightness()
-#endif
     uint32_t t0 = micros();
     // The overlapped push converts the next 64 bytes while the previous 64
     // are on the wire, instead of spinning -- see frame_push.h. It declines
@@ -3451,19 +2370,11 @@ static inline void pushFrame(int x, int y) {
     // so DIAGNOSTICS and the [frame] line measure the same thing either way.
     // The buffer and its REAL size: with a viewport set the sprite reports the
     // viewport's size, not the buffer's, and cyd35 pushes through one.
-#if defined(CROWPANEL7)
-    // No wire to overlap and no pushSprite fallback: the framebuffer is
-    // memory, and CrowBlit writes the changed rows straight into it, doing
-    // the 8->16 bit conversion on the way. It declines only if the panel
-    // never came up, in which case there is nowhere to put the frame at all.
-    CrowBlit::push(frame.buf(), frame.bufW(), frame.bufH(), x, y);
-#else
     if (frame.getColorDepth() != 8 ||
         !FramePush::push(tft, frame.buf(), frame.bufW(), frame.bufH(), x, y)) {
         frame.pushSprite(x, y);
         FramePush::invalidate();   // the panel now holds something push() did not record
     }
-#endif
     s_pushAccumUs += micros() - t0;
 }
 
@@ -3534,487 +2445,15 @@ static const char* s_lastScreenName = nullptr;
 static uint32_t    s_lastScreenUs   = 0;
 static uint32_t    s_lastScreenAt   = 0;     // transitionStart of the screen being timed
 
-#if defined(TWATCH_S3)
-// ---- GPS and wardriving (the T-Watch S3 Plus) --------------------------------
-// The S3 Plus carries a u-blox MIA-M10Q (an LS550G on some batches). Its
-// sentences go to Gnss (gnss.h); a fix stamps what Wardrive (wardrive.h)
-// writes. The plain S3 has no GNSS: the probe finds nothing, says so once,
-// and powers the rails back down.
-//
-// The board variant (arduino-esp32 variants/lilygo_twatch_s3) has the ESP32
-// receiving on GPIO41 and sending on 42; LilyGo's docs table names the same
-// pins from the module's side, which reads the other way round. Power: BLDO1
-// on revisions with BOOT/RST buttons, DC3 on earlier ones, and the LS550G
-// version also wants DC4 at 850 mV (LilyGoLib docs/hardware).
-//
-// Console: GPS / GPS OFF / GPS STATUS; GPS FAKE lat lon (a bench fix, rows
-// marked and left out of an export); WARDRIVE ON / OFF; WIGLE (the file, over
-// USB), WIGLE ALL (bench rows too), WIGLE CLEAR.
-static bool     s_gpsOn = false, s_gpsFound = false;
-static uint8_t  s_gpsTry = 0;           // index into GPS_BAUDS, then the DC4 retry
-static uint32_t s_gpsTryAt = 0, s_gpsSumAt = 0, s_gpsGoodAt = 0;
-// Resting: indoors the GPS searches flat out all day and never fixes (3.7 h
-// at work on 2026-09-29). After SEARCH_FIRST_MS with no fix it is powered
-// down for REST_MS, then gets RETRY_MS to find the sky before resting again;
-// a fix resets it to the long first search.
-static const uint32_t GPS_SEARCH_FIRST_MS = 10u * 60u * 1000u;
-static const uint32_t GPS_RETRY_MS        = 2u * 60u * 1000u;
-static const uint32_t GPS_REST_MS         = 5u * 60u * 1000u;
-static bool     s_gpsResting = false, s_gpsRetried = false;
-static uint32_t s_gpsSearchFrom = 0, s_gpsRestUntil = 0, s_gpsLastFixAt = 0;
-static const uint32_t GPS_BAUDS[] = { 38400, 9600, 115200 };
-// The best since switched on, for a watch that was off the cable while it
-// happened: GPS STATUS asks.
-static uint32_t s_gpsOnAt = 0, s_gpsFirstFixMs = 0;
-static uint8_t  s_gpsBestView = 0, s_gpsBestHeard = 0, s_gpsBestUsed = 0;
-static bool     s_gpsSummaries = false;  // the 5 s lines, only when asked for on the console
-extern volatile uint8_t g_consoleGps;    // 1 on, 2 off, 3 status, 4 fake, 5..7 wardrive/wigle
-extern volatile int32_t g_consoleFakeLat7, g_consoleFakeLon7;
-
-static void gpsPower(bool on, bool dc4) {
-    if (on) {
-        s_pmu.setBLDO1Voltage(3300); s_pmu.enableBLDO1();
-        s_pmu.setDC3Voltage(3300);   s_pmu.enableDC3();
-        if (dc4) { s_pmu.setDC4Voltage(850); s_pmu.enableDC4(); }
-    } else {
-        s_pmu.disableBLDO1(); s_pmu.disableDC3(); s_pmu.disableDC4();
-    }
-}
-
-static void gpsOpen(uint32_t baud) {
-    Serial1.end();
-    Serial1.begin(baud, SERIAL_8N1, 41, 42);   // our RX 41, TX 42
-    s_gpsTryAt = millis();
-    s_gpsGoodAt = Gnss::good();
-}
-
-static void gpsStart(bool summaries) {
-    if (!s_pmuOk) return;
-    s_gpsOn = true; s_gpsFound = false; s_gpsTry = 0;
-    s_gpsSummaries = summaries;
-    s_gpsOnAt = millis(); s_gpsFirstFixMs = 0;
-    s_gpsResting = false; s_gpsRetried = false; s_gpsSearchFrom = millis(); s_gpsLastFixAt = 0;
-    s_gpsBestView = s_gpsBestHeard = s_gpsBestUsed = 0;
-    Gnss::reset();
-    gpsPower(true, false);
-    delay(50);
-    gpsOpen(GPS_BAUDS[0]);
-    s_gpsSumAt = millis();
-}
-
-static void gpsStop() {
-    s_gpsOn = false;
-    s_gpsResting = false;
-    Serial1.end();
-    gpsPower(false, false);
-}
-
-#if SQUACH_LORA
-// New LoRa chat messages: a pink pill at the top of the main screen, under
-// the GPS counter when that is showing, and only while there is something
-// unread. A tap opens LORA CHATS. Drawn with the GPS counter, under the
-// speech bubbles.
-static int16_t s_loraBadgeX = -1, s_loraBadgeY = 0, s_loraBadgeW = 0, s_loraBadgeH = 0;
-void twatchLoraBadge(TFT_eSPI& t) {
-    s_loraBadgeX = -1;
-    const uint16_t u = uiLoraChatUnread();
-    if (!u || Settings::loraListen() == 0) return;
-    char txt[20];
-    snprintf(txt, sizeof txt, "LORA %u NEW", (unsigned)u);
-    t.setTextSize(Theme::uiTextSize(t, 1));
-    const int w = t.textWidth(txt) + 10, h = t.fontHeight() + 6;
-    const int x = (t.width() - w) / 2;
-    const int y = s_gpsOn ? 4 + h + 3 : 4;
-    t.fillRoundRect(x, y, w, h, 4, Theme::BG);
-    t.drawRoundRect(x, y, w, h, 4, Theme::PINK);
-    t.setTextColor(Theme::PINK, Theme::BG);
-    t.setCursor(x + 5, y + 3);
-    t.print(txt);
-    s_loraBadgeX = (int16_t)x; s_loraBadgeY = (int16_t)y; s_loraBadgeW = (int16_t)w; s_loraBadgeH = (int16_t)h;
-}
-// A finger's worth of slack around it: the pill is small on a watch.
-static bool twatchLoraBadgeHit(int x, int y) {
-    return s_loraBadgeX >= 0 && x >= s_loraBadgeX - 8 && x < s_loraBadgeX + s_loraBadgeW + 8 &&
-           y >= s_loraBadgeY - 6 && y < s_loraBadgeY + s_loraBadgeH + 8;
-}
-// One soft buzz for a new message, not while the chats are open, and not
-// more than once in thirty seconds however busy the channel is.
-static void twatchLoraBuzzTick(uint32_t now) {
-    static uint32_t lastCheck = 0, lastBuzz = 0;
-    static uint16_t lastUnread = 0;
-    if (now - lastCheck < 1000) return;
-    lastCheck = now;
-    const uint16_t u = uiLoraChatUnread();
-    if (u > lastUnread && state != AppState::LORA_CHAT && (!lastBuzz || now - lastBuzz > 30000)) {
-        lastBuzz = now;
-        twatchBuzz(Buzz::MESSAGE);
-    }
-    lastUnread = u;
-}
-#endif
-
-// While the GPS is on, a small counter at the top of the main screen: how
-// many satellites it hears, how many it uses, FIX once it has one -- and,
-// wardriving, how many rows are kept. Read without a cable, on a windowsill.
-// Drawn by uiClearTick() straight after the background, like the corner
-// clock, so Squachy's speech bubbles go over it rather than under it.
-void twatchGpsBadge(TFT_eSPI& t) {
-    if (!s_gpsOn) return;
-    const Gnss::Sky k = Gnss::sky();
-    const Gnss::Fix& f = Gnss::fix();
-    const bool fix = Gnss::fresh(millis());
-    char txt[40];
-    if (s_gpsResting)                  snprintf(txt, sizeof txt, "GPS RESTING");
-    else if (!s_gpsFound)              snprintf(txt, sizeof txt, "GPS STARTING");
-    else if (fix && Wardrive::enabled()) snprintf(txt, sizeof txt, "GPS FIX %u  %lu ROWS", f.used, (unsigned long)Wardrive::count());
-    else if (fix)                      snprintf(txt, sizeof txt, "GPS FIX  %u SATS", f.used);
-    else                               snprintf(txt, sizeof txt, "GPS %u HEARD  %u USED", k.heard, f.used);
-    t.setTextSize(Theme::uiTextSize(t, 1));
-    const int w = t.textWidth(txt) + 10, h = t.fontHeight() + 6;
-    const int x = (t.width() - w) / 2, y = 4;
-    const uint16_t col = fix ? Theme::GREEN : Theme::CYAN;
-    t.fillRoundRect(x, y, w, h, 4, Theme::BG);
-    t.drawRoundRect(x, y, w, h, 4, col);
-    t.setTextColor(col, Theme::BG);
-    t.setCursor(x + 5, y + 3);
-    t.print(txt);
-}
-
-// The WiGLE file over USB, between two marker lines tools/wigle_dump.py looks
-// for. The native USB console drops what does not fit its buffer (see the
-// setTxTimeoutMs(0) in setup), and the first export lost the end of the
-// column line that way. So this writes only as much as the buffer has room
-// for, and waits for the host to take the rest; a host that stops reading
-// for two seconds ends the export rather than hanging the watch.
-static bool usbWriteAll(const char* p, size_t n) {
-    uint32_t waitFrom = millis();
-    while (n) {
-        const int room = Serial.availableForWrite();
-        if (room <= 0) {
-            if (millis() - waitFrom > 2000) return false;
-            delay(1);
-            continue;
-        }
-        const size_t k = (size_t)room < n ? (size_t)room : n;
-        const size_t w = Serial.write((const uint8_t*)p, k);
-        p += w; n -= w;
-        if (w) waitFrom = millis();
-    }
-    return true;
-}
-
-static void wigleExport(bool includeFake) {
-    char buf[512];   // the two header lines run past 330 with a long version string
-    struct Ctx { bool fake, ok; uint32_t rows, skipped; char* buf; } c = { includeFake, true, 0, 0, buf };
-    usbWriteAll("=== WIGLE BEGIN ===\n", 20);
-    const size_t h = Wardrive::headerLines(buf, sizeof buf, FIRMWARE_VERSION, "twatch-s3", "LilyGo T-Watch S3 Plus");
-    c.ok = usbWriteAll(buf, h);
-    if (c.ok) Wardrive::forEach([](const Wardrive::Record& r, void* p) {
-        Ctx& c = *(Ctx*)p;
-        if ((r.flags & Wardrive::F_FAKE) && !c.fake) { c.skipped++; return true; }
-        const size_t n = Wardrive::csvRow(r, c.buf, 320);
-        if (n && !usbWriteAll(c.buf, n)) { c.ok = false; return false; }
-        if (n) c.rows++;
-        return true;
-    }, &c);
-    const int n = snprintf(buf, sizeof buf, "=== WIGLE END %lu rows (%lu bench rows left out)%s ===\n",
-                           (unsigned long)c.rows, (unsigned long)c.skipped, c.ok ? "" : " INCOMPLETE");
-    usbWriteAll(buf, (size_t)n);
-}
-
-static void gpsTick() {
-    const uint8_t cmd = g_consoleGps;
-    if (cmd) g_consoleGps = 0;
-    if (cmd == 1) { gpsStart(true); Serial.println("[gps] on"); }
-    else if (cmd == 2) { gpsStop(); Serial.println("[gps] off"); }
-    else if (cmd == 3) {
-        const Gnss::Fix& f = Gnss::fix();
-        Serial.printf("[gps] status: %s; on %lu s; most in view %u, heard %u, used %u; ",
-                      s_gpsOn ? "on" : "off", s_gpsOn ? (unsigned long)((millis() - s_gpsOnAt) / 1000) : 0ul,
-                      s_gpsBestView, s_gpsBestHeard, s_gpsBestUsed);
-        if (s_gpsFirstFixMs) Serial.printf("FIRST FIX after %lu s%s, now %s at %ld,%ld\n",
-                                           (unsigned long)(s_gpsFirstFixMs / 1000), Gnss::faked() ? " (fake)" : "",
-                                           Gnss::fresh(millis()) ? "fixed" : "lost", (long)f.lat7, (long)f.lon7);
-        else Serial.println("never had a fix");
-        Serial.printf("[wardrive] %s; %lu rows kept of %lu; this boot %lu written, %lu skipped as repeats, %lu dropped\n",
-                      Wardrive::enabled() ? "ON" : "off", (unsigned long)Wardrive::count(), (unsigned long)Wardrive::capacity(),
-                      (unsigned long)Wardrive::written(), (unsigned long)Wardrive::skipped(), (unsigned long)Wardrive::dropped());
-    }
-    else if (cmd == 4) {
-        const uint32_t e = Clock::isSet() ? Clock::nowEpoch() : 0;
-        Gnss::fake(g_consoleFakeLat7, g_consoleFakeLon7, e, millis());
-        if (!s_gpsFirstFixMs) s_gpsFirstFixMs = millis() - s_gpsOnAt + 1;
-        Serial.printf("[gps] BENCH FIX at %ld,%ld%s -- rows written now are marked and left out of WIGLE\n",
-                      (long)g_consoleFakeLat7, (long)g_consoleFakeLon7, e ? "" : "; the clock is not set, so no rows until it is");
-    }
-    else if (cmd == 5) { Wardrive::setEnabled(true);  if (!s_gpsOn) gpsStart(false); Serial.println("[wardrive] ON"); }
-    else if (cmd == 6) { Wardrive::setEnabled(false); gpsStop(); Serial.println("[wardrive] off"); }
-    else if (cmd == 7) wigleExport(false);
-    else if (cmd == 8) wigleExport(true);
-    else if (cmd == 9) { Wardrive::clear(); Serial.println("[wardrive] cleared"); }
-
-    // A bench fix is held until a real one replaces it; refreshed here so it
-    // does not go stale while the console test runs.
-    if (Gnss::faked()) Gnss::fake(Gnss::fix().lat7, Gnss::fix().lon7, Clock::isSet() ? Clock::nowEpoch() : 0, millis());
-
-    if (!s_gpsOn) { Wardrive::tick(millis()); return; }
-    if (s_gpsResting) {
-        if ((int32_t)(millis() - s_gpsRestUntil) < 0) { Wardrive::tick(millis()); return; }
-        // Back on, on the rails and baud that worked, for a short look.
-        s_gpsResting = false; s_gpsRetried = true; s_gpsSearchFrom = millis();
-        gpsPower(true, s_gpsTry >= 3);
-        delay(50);
-        gpsOpen(GPS_BAUDS[s_gpsTry % 3]);
-        Serial.println("[gps] awake again: looking for the sky");
-    }
-    while (Serial1.available()) Gnss::feed((char)Serial1.read(), millis());
-    const uint32_t now = millis();
-    if (Gnss::fresh(now) && !Gnss::faked()) { s_gpsLastFixAt = now; s_gpsRetried = false; }
-    if (s_gpsFound && !Gnss::fresh(now)) {
-        const uint32_t from = (int32_t)(s_gpsLastFixAt - s_gpsSearchFrom) > 0 ? s_gpsLastFixAt : s_gpsSearchFrom;
-        if (now - from > (s_gpsRetried ? GPS_RETRY_MS : GPS_SEARCH_FIRST_MS)) {
-            Serial1.end();
-            gpsPower(false, false);
-            s_gpsResting = true;
-            s_gpsRestUntil = now + GPS_REST_MS;
-            Serial.printf("[gps] no fix for %lu s: resting %lu s\n", (unsigned long)((now - from) / 1000),
-                          (unsigned long)(GPS_REST_MS / 1000));
-            Wardrive::tick(now);
-            return;
-        }
-    }
-    if (!s_gpsFound) {
-        if (Gnss::good() - s_gpsGoodAt >= 3) {
-            s_gpsFound = true;
-            Serial.printf("[gps] a GNSS is talking at %lu baud\n", (unsigned long)GPS_BAUDS[s_gpsTry % 3]);
-            // A GPS answered: this is an S3 Plus, and its bigger cell can
-            // take the faster charge from now on.
-            if (!Settings::watchPlus()) { Settings::setWatchPlus(); twatchApplyCharge(); }
-        } else if (now - s_gpsTryAt > 2500) {
-            // Three bauds with BLDO1 and DC3, then the same three with DC4 too.
-            s_gpsTry++;
-            if (s_gpsTry == 3) { gpsPower(true, true); delay(50); }
-            if (s_gpsTry >= 6) {
-                Serial.println("[gps] no GNSS answered: not an S3 Plus, or its GPS is not powered this way");
-                gpsStop();
-                // WARDRIVE on a watch with no GPS: say so and switch it off,
-                // rather than leave a row reading GPS STARTING forever.
-                if (Wardrive::enabled()) {
-                    Wardrive::setEnabled(false);
-                    Theme::showToast("NO GPS ON THIS WATCH", "Wardriving needs the S3 Plus", Theme::AMBER);
-                }
-                return;
-            }
-            gpsOpen(GPS_BAUDS[s_gpsTry % 3]);
-        }
-    }
-    const Gnss::Sky k = Gnss::sky();
-    const Gnss::Fix& f = Gnss::fix();
-    if (k.view > s_gpsBestView) s_gpsBestView = k.view;
-    if (k.heard > s_gpsBestHeard) s_gpsBestHeard = k.heard;
-    if (f.used > s_gpsBestUsed) s_gpsBestUsed = f.used;
-    if (f.valid && !Gnss::faked() && !s_gpsFirstFixMs) {
-        s_gpsFirstFixMs = now - s_gpsOnAt;
-        Serial.printf("[gps] FIRST FIX after %lu s, %u satellites\n", (unsigned long)(s_gpsFirstFixMs / 1000), f.used);
-    }
-    // Satellite time is the best clock this watch will ever be offered.
-    if (f.valid && !Gnss::faked() && Gnss::utcEpoch() && !Clock::trusted()) {
-        if (Clock::setEpoch(Gnss::utcEpoch())) Serial.println("[clock] set from GPS");
-    }
-    Wardrive::tick(now);
-    if (s_gpsSummaries && s_gpsFound && now - s_gpsSumAt > 5000) {
-        s_gpsSumAt = now;
-        Serial.printf("[gps] %s; %u used; in view %u, heard %u\n",
-                      Gnss::fresh(now) ? "FIX" : "no fix yet", f.used, k.view, k.heard);
-    }
-}
-
-// For the WARDRIVE row: 0 off, 1 looking for the module, 2 no fix, 3 fix,
-// 4 resting between looks.
-uint8_t twatchGpsState() {
-    if (!s_gpsOn) return 0;
-    if (s_gpsResting) return 4;
-    if (!s_gpsFound) return 1;
-    return Gnss::fresh(millis()) ? 3 : 2;
-}
-
-// At boot: the store, and the GPS back on if wardriving was left on.
-static void wardriveBegin() {
-    Wardrive::begin();
-    if (Wardrive::enabled()) gpsStart(false);
-}
-#endif
-
-// The runtime log: this boot's minutes, noted every ten minutes. On a board
-// that cannot read its battery, the last note before it died is how long
-// the charge lasted. RUNTIME on the console lists the last eight boots.
-extern volatile bool g_consoleRuntime;   // clock.cpp: RUNTIME
-static void runtimeTick(uint32_t now) {
-    static uint32_t lastAt = 0;
-    static bool first = true;
-    if (first || now - lastAt >= 600000UL) {
-        first = false;
-        lastAt = now;
-        Settings::noteRunMinutes(BlackBox::bootNumber(), (uint16_t)(now / 60000UL));
-    }
-    if (g_consoleRuntime) {
-        g_consoleRuntime = false;
-        uint16_t b[8], m[8];
-        const uint8_t n = Settings::runHistory(b, m, 8);
-        Serial.printf("[runtime] this boot %u, up %lu min; newest first:\n", (unsigned)BlackBox::bootNumber(), (unsigned long)(now / 60000UL));
-        for (uint8_t i = 0; i < n; i++)
-            Serial.printf("[runtime] boot %u ran %uh %02um%s\n", (unsigned)b[i], (unsigned)(m[i] / 60), (unsigned)(m[i] % 60),
-                          i == 0 ? " so far (this one)" : "");
-    }
-}
-
-#if defined(ESP32) && !defined(TWATCH_S3)
-// CHARGE MODE: the board keeps running while it charges -- there is no off
-// switch that leaves the charger on -- and a running board takes most of
-// what a small charger gives (about 200 mA of it). This stops the WiFi and
-// Bluetooth radios, the status light and the backlight and drops the CPU to
-// 80 MHz, so the charger's current goes into the cell. The screen shows how
-// long it has been charging for fifteen seconds; a tap on the dark screen
-// shows it again for five, and a tap while it shows wakes the board. The board cannot tell when the cell is
-// full, so the time is all there is to go on.
-static bool     s_chargeMode = false, s_chargeWasDown = false;
-// Asked for from the Settings row (or CHARGE on the console) and entered at
-// the top of the NEXT loop: entered in the middle of a pass, the rest of
-// that pass went on drawing the Settings screen over the charge screen.
-volatile bool   g_consoleCharge = false;
-static bool     s_chargeWanted = false;
-static uint32_t s_chargeAt = 0, s_chargeLitAt = 0, s_chargeLitUntil = 0, s_chargeDrawnAt = 0;
-
-static void chargeBacklight(uint8_t duty) {
-#if defined(CROWPANEL7)
-    CrowBL::set(duty);
-#else
-    ledcWrite(BL_CH_ORIG, duty);
-    ledcWrite(BL_CH_CAP,  duty);
-    ledcWrite(BL_CH_AWOK, duty);
-#endif
-}
-
-static void chargeDraw(uint32_t now) {
-    s_chargeDrawnAt = now;
-    const int w = tft.width(), h = tft.height();
-    tft.fillScreen(TFT_BLACK);
-    const uint32_t mins = (now - s_chargeAt) / 60000UL;
-    char line[32];
-    tft.setTextDatum(MC_DATUM);
-    tft.setTextColor(Theme::CYAN, TFT_BLACK);
-    tft.setTextSize(3);
-    tft.drawString("CHARGE MODE", w / 2, h / 2 - 50);
-    tft.setTextColor(TFT_WHITE, TFT_BLACK);
-    tft.setTextSize(2);
-    snprintf(line, sizeof line, "Charging %luh %02lum", (unsigned long)(mins / 60), (unsigned long)(mins % 60));
-    tft.drawString(line, w / 2, h / 2 - 10);
-    tft.setTextSize(1);
-    tft.setTextColor(Theme::blend(TFT_BLACK, TFT_WHITE, 170), TFT_BLACK);
-    tft.drawString("Radios and screen are off so the battery fills faster.", w / 2, h / 2 + 20);
-    tft.drawString("About 4-6 hours from empty.", w / 2, h / 2 + 34);
-    tft.setTextColor(Theme::GREEN, TFT_BLACK);
-    tft.setTextSize(2);
-    tft.drawString("TAP TO WAKE UP", w / 2, h / 2 + 64);
-    tft.setTextDatum(TL_DATUM);
-}
-
-static void enterChargeMode() {
-    const uint32_t now = millis();
-    s_chargeMode = true;
-    s_chargeAt = now;
-    s_chargeLitAt = now;
-    s_chargeLitUntil = now + 15000;
-    s_chargeWasDown = true;   // the tap that chose the row is not the first tap here
-    engine.restRadios(true);
-    StatusLight::off();
-    setCpuFrequencyMhz(80);
-    s_cpuMhzApplied = 80;
-    chargeBacklight(Settings::brightness() / 2);
-    chargeDraw(now);
-    Serial.println("[charge] CHARGE MODE on: radios, light and backlight off, CPU 80 MHz");
-}
-
-static void exitChargeMode() {
-    const uint32_t mins = (millis() - s_chargeAt) / 60000UL;
-    s_chargeMode = false;
-    engine.wakeRadios();
-    applyCpuClock();
-    applyBrightness();
-    lastTouch = millis();
-    FramePush::invalidate();
-    enterClear();
-    Serial.printf("[charge] CHARGE MODE off after %lu min\n", (unsigned long)mins);
-}
-
-static void chargeModeTick(uint32_t now) {
-    const TouchPoint tp = pollTouch();
-    const bool down = tp.valid;
-    const bool lit = (int32_t)(s_chargeLitUntil - now) > 0;
-    // A touch panel can drop out for a poll or two in the middle of one tap;
-    // a new tap only counts once the finger has been off for 150 ms, so one
-    // tap never reads as two and wakes the board by accident.
-    static uint32_t upAt = 0;
-    if (down != s_chargeWasDown) Serial.printf("[charge] touch %s at %d,%d (lit %d)\n", down ? "down" : "up", tp.x, tp.y, (int)lit);
-    if (!down && s_chargeWasDown) upAt = now;
-    if (down && !s_chargeWasDown && now - upAt > 150) {
-        if (lit && now - s_chargeLitAt > 800) { s_chargeWasDown = true; exitChargeMode(); return; }
-        // A tap on the dark screen: the charging time, for five seconds.
-        s_chargeLitAt = now;
-        s_chargeLitUntil = now + 5000;
-        chargeBacklight(Settings::brightness() / 2);
-        chargeDraw(now);
-    }
-    s_chargeWasDown = down;
-    // Asked again, not reused: a tap above has just lit the screen, and the
-    // answer from the top of this tick put it straight back out.
-    const bool litNow = s_chargeLitUntil && (int32_t)(s_chargeLitUntil - now) > 0;
-    if (litNow && now - s_chargeDrawnAt > 30000) chargeDraw(now);
-    if (!litNow && s_chargeLitUntil) { chargeBacklight(0); s_chargeLitUntil = 0; Serial.println("[charge] screen dark"); }
-    delay(40);   // nothing to animate: let the CPU idle between polls
-}
-#endif
-
 void loop() {
     // Cheap and unconditional: available() is a register read, and this
     // is the only way in for the one serial command the firmware takes.
     Clock::pollSerial();
-    runtimeTick(millis());
-#if defined(ESP32) && !defined(TWATCH_S3)
-    if (g_consoleCharge) { g_consoleCharge = false; s_chargeWanted = true; }
-    if (s_chargeWanted && !s_chargeMode) { s_chargeWanted = false; enterChargeMode(); }
-    if (s_chargeMode) { chargeModeTick(millis()); return; }
-#endif
     uint32_t frameStartUs = micros();
-    s_loopsSinceSay++;   // the real loop rate, pacing delays included; on the [frame] line
     FrameProf::begin();
     s_pushAccumUs = 0;
     FramePush::newFrame();
     uint32_t now = millis();
-#if defined(TWATCH_S3)
-    twatchCrownTick(now);
-    twatchMotionTick(now);
-    twatchXtalTick(now);
-    if (g_consoleXtal) { g_consoleXtal = false; twatchXtalStart(); }
-    twatchRadioTick(now);
-    twatchRadioHealTick(now);
-    twatchBatteryTick(now);
-    if (g_consoleBatt) { g_consoleBatt = false; twatchBatterySample(BlackBox::BATT_WHY_TIMER); }
-    if (g_consoleBattLog) {
-        g_consoleBattLog = false;
-        Serial.println("[battlog] newest first: boot  up(s)  epoch  mV  %  flags(usb/chg/scr/radio)  cpu  why  chipC  steady  adverts  frames");
-        BlackBox::forEachBattery([](const BlackBox::BattRecord& r, void*) {
-            Serial.printf("[battlog] %u  %lu  %lu  %u  %u  %c%c%c%c  %u  %u\n", (unsigned)r.boot,
-                          (unsigned long)r.upSec, (unsigned long)r.epoch, (unsigned)r.mv, (unsigned)r.pct,
-                          (r.flags & BlackBox::BATT_USB) ? 'U' : '-', (r.flags & BlackBox::BATT_CHARGING) ? 'C' : '-',
-                          (r.flags & BlackBox::BATT_SCREEN_ON) ? 'S' : '-', (r.flags & BlackBox::BATT_RADIOS_ON) ? 'R' : '-',
-                          (unsigned)r.cpuMhz10 * 10, (unsigned)r.why);
-            Serial.printf("[battlog]    %d C  %u  %lu  %lu\n", (int)r.chipC, (unsigned)r.steady,
-                          (unsigned long)r.adverts, (unsigned long)r.frames);
-            return true;
-        }, nullptr);
-    }
-#endif
     Clock::tick(now);   // the note to self, when it is due
 #if SQUACH_MESH && defined(BENCH_TOOLS)
     if (g_benchUpdateNow && (state == AppState::CLEAR || state == AppState::DESK)) {
@@ -4039,8 +2478,6 @@ void loop() {
     if (g_benchPrimNow) { g_benchPrimNow = false; runPrimBench(); }
 #endif
     Bingo::tick(now);
-    Dex::tick(now);
-    Regulars::tick(now);
     {
         DetectionType bt = DetectionType::UNKNOWN;
         char sub[40];
@@ -4094,10 +2531,6 @@ void loop() {
         touchJustUp = false;
     }
     engine.loop();
-    Lora::tick(now);   // nothing outside a SQUACH_LORA build
-#if SQUACH_LORA && defined(TWATCH_S3)
-    twatchLoraBuzzTick(now);
-#endif
     floodTick();   // nothing outside a FLOOD_BENCH build
     // The heap at the first pass of loop(), for DIAGNOSTICS' BOOT line.
     static uint32_t s_loopHeapFree = 0, s_loopHeapLargest = 0;
@@ -4198,114 +2631,13 @@ void loop() {
     // drawTitleBar) and this handler is skipped — so there is no control
     // on screen that looks live and does nothing.
 #if !defined(AWOK)
-    // Neither corner button answers a finger that is carrying Squachy: dragged
-    // into a corner, he used to open Settings or rotate the screen mid-carry,
-    // and the release that would have dropped him never came.
-#if defined(TWATCH_S3)
-    // Every AXP2101 register, sixteen to a line, so a deaf boot and a
-    // hearing boot can be compared register by register.
-    if (g_consoleMotion) {
-        g_consoleMotion = false;
-        Serial.printf("[motion] %s: x %d y %d z %d, moved %u of the last 128 s, %s; snooze after %u\n",
-                      s_bmaOk ? "BMA423" : "no sensor", s_acc[0], s_acc[1], s_acc[2], (unsigned)movedSecs(),
-                      twatchStill() ? "STILL" : "MOVING", (unsigned)Settings::autoQuietAfter());
-    }
-    if (g_consoleBuzz) {
-        g_consoleBuzz = false;
-        Serial.printf("[buzz] test: screen %s, cpu %u MHz, driver status %02X mode %02X lib %02X\n",
-                      s_panelAsleep ? "asleep" : "awake", (unsigned)getCpuFrequencyMhz(),
-                      drvRead(0x00), drvRead(0x01), drvRead(0x03));
-        twatchBuzz(Buzz::SAMPLE);
-        const uint8_t go0 = drvRead(0x0C);
-        delay(60);
-        const uint8_t go1 = drvRead(0x0C);
-        delay(400);
-        Serial.printf("[buzz] test: GO %u right after, %u at 60 ms, %u at 460 ms; status %02X\n",
-                      go0, go1, drvRead(0x0C), drvRead(0x00));
-    }
-    if (g_consoleRtc) {
-        g_consoleRtc = false;
-        bool lost = false, foreign = false;
-        const uint32_t t = rtcRead(&lost, &foreign);
-        Serial.printf("[rtc] chip %lu, system %lu, %s\n", (unsigned long)t, (unsigned long)Clock::nowEpoch(),
-                      lost ? "LOST (backup ran out)" : foreign ? "not set by SquachWatch" : t ? (Clock::trusted() ? "clock trusted" : "clock not trusted") : "no time");
-    }
-    if (g_consolePmu) {
-        g_consolePmu = false;
-        for (uint8_t base = 0x00; base < 0xA0; base += 16) {
-            char line[80];
-            int n = snprintf(line, sizeof line, "[pmu] %02X:", base);
-            for (uint8_t k = 0; k < 16; k++) {
-                Wire1.beginTransmission(0x34);
-                Wire1.write((uint8_t)(base + k));
-                uint8_t v = 0xEE;
-                if (Wire1.endTransmission(false) == 0 && Wire1.requestFrom((uint8_t)0x34, (uint8_t)1) == 1) v = Wire1.read();
-                n += snprintf(line + n, sizeof line - n, " %02X", v);
-            }
-            Serial.println(line);
-        }
-    }
-    gpsTick();
-#endif
-#if defined(ESP32) && !defined(SQW_S3) && !defined(CROWPANEL7)   // hardware only: the emulators build this too
-    // ADC: every input-only analog pin the CYDs leave free, in millivolts,
-    // averaged over 16 reads. A battery divider shows up as about half the
-    // cell's voltage, and moves when the cell is unplugged.
-    if (g_consoleAdc) {
-        g_consoleAdc = false;
-        const uint8_t pins[] = { 34, 35, 36, 39 };
-        char line[96]; int n = snprintf(line, sizeof line, "[adc]");
-        for (uint8_t p : pins) {
-            uint32_t mv = 0;
-            for (int k = 0; k < 16; k++) mv += analogReadMilliVolts(p);
-            n += snprintf(line + n, sizeof line - n, "  GPIO%u %lu mV", p, (unsigned long)(mv / 16));
-        }
-        Serial.println(line);
-    }
-#endif
-    if (g_consoleInvert) {
-        g_consoleInvert = false;
-        Settings::toggleInvert();
-        tft.invertDisplay(PANEL_NEEDS_INVERSION != Settings::inverted());
-        Serial.printf("[console] invert setting %s (panel baseline %s)\n", Settings::inverted() ? "ON" : "OFF",
-                      PANEL_NEEDS_INVERSION ? "inverted" : "normal");
-    }
-    // WATCHTEST: put the newest device in the log on the watch list and count
-    // this as its first hit, so the LOCKED ON screen comes up at the next
-    // home-screen tick and then fills in from its real signal. Live Bluetooth
-    // first, then live WiFi, then anything the black box brought back. It is a
-    // real watch: REMOVE FROM WATCH LIST ends it.
-    if (g_consoleWatchTest) {
-        g_consoleWatchTest = false;
-        const Detection* pick = nullptr;
-        for (uint8_t pass = 0; pass < 3 && !pick; pass++)
-            for (uint8_t i = 0; i < engine.logCount() && !pick; i++) {
-                const Detection* d = engine.logAt(i);
-                if (!d) continue;
-                const bool ble = d->channel == 0;
-                if (pass == 2 || (!d->restored && (pass == 0) == ble)) pick = d;
-            }
-        if (!pick) {
-            Serial.println("[watch] test: the log is empty; wait for a detection");
-        } else {
-            const bool ble = pick->channel == 0;
-            const char* label = pick->name[0] ? pick->name : detectionTypeName(pick->type);
-            if (ble) engine.watchBle(pick->mac, label);
-            else     engine.watchWifi(pick->mac, label);
-            engine.forceWatchHit(pick->rssi);
-            Serial.printf("[watch] test: watching %s (%s over %s, %d dBm%s); the alert shows on the home screen\n",
-                          engine.watchLabel(), detectionTypeName(pick->type), ble ? "Bluetooth" : "WiFi",
-                          (int)pick->rssi, pick->restored ? ", from before this boot" : "");
-        }
-    }
-    if (g_consoleRotate || (tp.valid && !Settings::rotationLocked() && !Squachy::isHeld() &&
+    if (tp.valid && !Settings::rotationLocked() &&
         (state == AppState::CLEAR || state == AppState::LOG ||
                       state == AppState::SETTINGS || state == AppState::OUTFIT ||
                       state == AppState::RAWSCAN || state == AppState::DETECTION_FILTER ||
                       state == AppState::IGNORE_LIST || state == AppState::DESK) &&
         Theme::rotateButtonHit(tp.x, tp.y, tft.width()) &&
-        (now - lastTouch) > TOUCH_DEBOUNCE_MS)) {
-        if (g_consoleRotate) { g_consoleRotate = false; Serial.printf("[console] rotation -> %u\n", (unsigned)((screenRotation + 1) % 4)); }
+        (now - lastTouch) > TOUCH_DEBOUNCE_MS) {
         lastTouch = now;
         Squachy::trigger(Squachy::Event::ROTATED);
         screenRotation = (screenRotation + 1) % 4;
@@ -4364,8 +2696,7 @@ void loop() {
     // it was entered from — this is the only way back out of either
     // screen, since OUTFIT's own taps are all claimed by the arrows and
     // DETECTION_FILTER's are all claimed by row toggles.
-    if (tp.valid && !Squachy::isHeld() &&
-        (state == AppState::CLEAR || state == AppState::LOG ||
+    if (tp.valid && (state == AppState::CLEAR || state == AppState::LOG ||
                       state == AppState::SETTINGS || state == AppState::OUTFIT ||
                       state == AppState::RAWSCAN || state == AppState::DETECTION_FILTER ||
                       state == AppState::IGNORE_LIST || state == AppState::POWER_SAVER ||
@@ -4473,6 +2804,14 @@ void loop() {
             if (crashCardWanted()) drawCrashCard(*canvas);
 #endif
             bool leave = uiBootDone(bootStart, crashCardWanted() ? 9000 : 3000);
+            if (!leave && touchJustDown && ignoreButtonHit(tp.x, tp.y, canvas->width())) {
+                ignoreShortBoots();
+                // The finger is still down where the next screen's own
+                // bottom-right button will be (BACK on the desk); the rest
+                // of this gesture is swallowed, as the calibration hatch does.
+                s_swallowTouch = true;
+                leave = true;
+            }
             if (leave) {
                 // First-ever boot only -- goes straight into the normal
                 // onboarding overlay once this screen's own DONE button
@@ -4496,15 +2835,6 @@ void loop() {
                 // the settings menu: somebody who opened the card to look at
                 // it wants the board back, not another list.
                 if (uiBingoHitTest(*canvas, tp.x, tp.y, tft.width(), tft.height()) == BingoTap::BACK)
-                    goHome();
-            }
-            break;
-        }
-        case AppState::DEX: {
-            drawTwoBand([&](TFT_eSPI& t, bool advance) { uiDexTick(t, now, engine, advance); });
-            if (touchJustDown) {
-                lastTouch = now;
-                if (uiDexHitTest(*canvas, tp.x, tp.y, tft.width(), tft.height()) == DexTap::BACK)
                     goHome();
             }
             break;
@@ -4743,7 +3073,6 @@ void loop() {
             static bool     sqPetting = false;
             static uint32_t sqStartMs = 0;
             static int      sqStartX = 0, sqStartY = 0;
-            static int32_t  sqLastDx = 0;   // the stroke's reach so far, for the flick
             constexpr uint32_t SQ_HOLD_MS = 600;
             constexpr int32_t  SQ_MOVE_PX = 12;
             constexpr int32_t  SQ_MOVE_PX_SQ = SQ_MOVE_PX * SQ_MOVE_PX;
@@ -4786,7 +3115,6 @@ void loop() {
                 sqStartMs = now;
                 sqStartX = tp.x;
                 sqStartY = tp.y;
-                sqLastDx = 0;
                 clrHoldActive = !s_scanPickerOpen && barBtn == ButtonId::CLR;
                 clrHoldFired  = false;
                 clrHoldStart  = now;
@@ -4834,14 +3162,6 @@ void loop() {
                 lastTouch = now;
                 sqActive  = false;
                 enterMeshCompose();
-#if SQUACH_LORA && defined(TWATCH_S3)
-            } else if (touchJustDown && (now - lastTouch) > TOUCH_DEBOUNCE_MS &&
-                       twatchLoraBadgeHit(tp.x, tp.y)) {
-                // The LORA pill: straight to the chats.
-                lastTouch = now;
-                sqActive  = false;
-                enterLoraChat();
-#endif
             } else if (touchJustDown && (now - lastTouch) > TOUCH_DEBOUNCE_MS &&
                        uiClearWatchPillHit(tp.x, tp.y)) {
                 // The watch/hunt pill. Opens the alert screen, which names the
@@ -4930,7 +3250,6 @@ void loop() {
                 // straight back into petting, and he could never be
                 // picked up at all.
                 if (!sqHeld && (dx * dx + dy * dy) > SQ_MOVE_PX_SQ) sqPetting = true;
-                sqLastDx = dx;
                 if (sqHeld) {
                     Squachy::grabTo(tp.x, tp.y);
                 } else if (sqPetting) {
@@ -4973,12 +3292,7 @@ void loop() {
                 if (sqHeld) {
                     Squachy::release();     // drop him wherever he ended up
                 } else if (!sqPetting) {
-                    Squachy::noteTapAt(sqStartX, sqStartY);
                     Squachy::trigger(Squachy::Event::PETTED);
-                } else if ((now - sqStartMs) < 320 && (sqLastDx > 48 || sqLastDx < -48)) {
-                    // A stroke that covered fifty pixels in under a third of a
-                    // second is a flick, not a pet.
-                    Squachy::flick(sqLastDx > 0 ? 1 : -1);
                 }
                 sqActive = false;
             }
@@ -5058,7 +3372,7 @@ void loop() {
                         // dismiss step once you'd already read the
                         // explanation.
                         s_infoPending = false;
-                        squachyCatch(lastAlertType, s_alertMac, lastAlertHits, lastAlertRssi, lastAlertConf);
+                        Squachy::trigger(Squachy::Event::DETECTION, lastAlertType, engine.lifetimeTotal(), lastAlertHits, lastAlertRssi, lastAlertConf);
                         enterClear();
                     }
                 }
@@ -5094,7 +3408,8 @@ void loop() {
                     lastTouch = now;
                     if (IgnoreList::contains(s_alertMac)) IgnoreList::remove(s_alertMac);
                     else                                  IgnoreList::add(s_alertMac, lastAlertType);
-                    squachyCatch(lastAlertType, s_alertMac, lastAlertHits, lastAlertRssi, lastAlertConf);
+                    Squachy::trigger(Squachy::Event::DETECTION, lastAlertType,
+                                     engine.lifetimeTotal(), lastAlertHits, lastAlertRssi, lastAlertConf);
                     enterClear();
                 } else if (uiAlertHitSnooze(tp.x, tp.y, tft.width(), tft.height())) {
                     // This device, until the board restarts: no more alerts
@@ -5105,7 +3420,8 @@ void loop() {
                     lastTouch = now;
                     IgnoreList::snooze(s_alertMac);
                     Theme::showToast("SNOOZED", "This one, until restart", Theme::AMBER);
-                    squachyCatch(lastAlertType, s_alertMac, lastAlertHits, lastAlertRssi, lastAlertConf);
+                    Squachy::trigger(Squachy::Event::DETECTION, lastAlertType,
+                                     engine.lifetimeTotal(), lastAlertHits, lastAlertRssi, lastAlertConf);
                     enterClear();
                 } else if (uiAlertHitHunt(tp.x, tp.y, tft.width(), tft.height())) {
                     // Same call pair LOG's confirm panel makes. The
@@ -5117,14 +3433,14 @@ void loop() {
                     // on the info panel) both fire it.
                     if (s_alertIsBle) engine.huntBle(s_alertMac, s_alertLabel);
                     else              engine.huntWifi(s_alertMac, s_alertLabel);
-                    squachyCatch(lastAlertType, s_alertMac, lastAlertHits, lastAlertRssi, lastAlertConf);
+                    Squachy::trigger(Squachy::Event::DETECTION, lastAlertType, engine.lifetimeTotal(), lastAlertHits, lastAlertRssi, lastAlertConf);
                     enterHunt();
                 } else {
-                    squachyCatch(lastAlertType, s_alertMac, lastAlertHits, lastAlertRssi, lastAlertConf);
+                    Squachy::trigger(Squachy::Event::DETECTION, lastAlertType, engine.lifetimeTotal(), lastAlertHits, lastAlertRssi, lastAlertConf);
                     enterClear();
                 }
             } else if ((now - alertStart) > ALERT_AUTO_DISMISS_MS) {
-                squachyCatch(lastAlertType, s_alertMac, lastAlertHits, lastAlertRssi, lastAlertConf);
+                Squachy::trigger(Squachy::Event::DETECTION, lastAlertType, engine.lifetimeTotal(), lastAlertHits, lastAlertRssi, lastAlertConf);
                 enterClear();
             }
             break;
@@ -5188,20 +3504,14 @@ void loop() {
                 lastTouch = now;
                 // The button ends the watch; anywhere else just dismisses the
                 // alert and leaves it running. Both land back on CLEAR.
-                const bool remove = uiWatchAlertHitRemove(*canvas, tp.x, tp.y);
-                if (remove) {
+                if (uiWatchAlertHitRemove(*canvas, tp.x, tp.y)) {
                     engine.clearWatch();
                     Theme::showToast("UNWATCHED", nullptr, Theme::CYAN);
                 }
-                // Which of the two a tap was, and where it landed: a REMOVE
-                // that reads as a plain close leaves the watch running, and
-                // from the wrist the two look the same until it pops up again.
-                Serial.printf("[watch] tap at %d,%d: %s\n", (int)tp.x, (int)tp.y,
-                              remove ? "REMOVE, no longer watching" : "closed, still watching");
+                enterClear();
+            } else if ((now - watchAlertStart) > ALERT_AUTO_DISMISS_MS) {
                 enterClear();
             }
-            // No timeout: the thing you asked to be told about is here, and
-            // the alert stays until you have seen it and tapped.
             break;
         }
         case AppState::LOG: {
@@ -5219,8 +3529,7 @@ void loop() {
                 uiLogTick(t, now, engine, 0, s_confirmPending, s_confirmLabel,
                           s_infoPending, infoTypeName, infoText,
                           engine.isWatched(s_confirmMac, s_confirmIsBle),
-                          engine.isHunted(s_confirmMac, s_confirmIsBle),
-                          IgnoreList::contains(s_confirmMac));
+                          engine.isHunted(s_confirmMac, s_confirmIsBle));
                 Theme::drawToast(t, now);
             });
 
@@ -5327,14 +3636,12 @@ void loop() {
             static bool gestureMoved  = false;
             static int  gestureStartX = 0, gestureStartY = 0;
             static int  lastY = -1;
-            static uint32_t gestureDownMs = 0;
             if (touchJustDown) {
                 gestureActive = true;
                 gestureMoved  = false;
                 gestureStartX = tp.x;
                 gestureStartY = tp.y;
                 lastY = tp.y;
-                gestureDownMs = now;
             }
             if (tp.valid && gestureActive) {
                 int dy = tp.y - lastY;
@@ -5345,7 +3652,7 @@ void loop() {
                 }
             }
             if (touchJustUp && gestureActive) {
-                if (!gestureMoved && now - gestureDownMs <= TAP_MAX_MS) {
+                if (!gestureMoved) {
                     lastTouch = now;
                     ButtonId b = Theme::hitTestButtonBar(gestureStartX, gestureStartY, tft.width(), tft.height());
                     if (b == ButtonId::SCAN) { enterClear(); }
@@ -5410,8 +3717,7 @@ void loop() {
             drawTwoBand([&](TFT_eSPI& t, bool advance) {
                 uiRawScanTick(t, now, engine, s_rawScanIsBle, done, s_confirmPending, s_confirmLabel,
                               engine.isWatched(s_confirmMac, s_rawScanIsBle),
-                              engine.isHunted(s_confirmMac, s_rawScanIsBle),
-                              IgnoreList::contains(s_confirmMac), advance);
+                              engine.isHunted(s_confirmMac, s_rawScanIsBle), advance);
                 Theme::drawToast(t, now);
             });
 
@@ -5586,12 +3892,6 @@ void loop() {
             static bool gestureMoved  = false;
             static int  gestureStartX = 0, gestureStartY = 0;
             static int  lastY = -1;
-            // A tap is short. A thumb that rests on a row for half a second
-            // was reaching for the list to scroll it, not choosing the row --
-            // people kept opening things they were only scrolling past -- so
-            // a long touch that never moved is spent, not acted on. Buttons
-            // that need a hold (nothing on this screen) are unaffected.
-            static uint32_t gestureDownMs = 0;
             // While a confirm panel is up it owns the screen: it answers the
             // tap, and the list underneath neither scrolls nor acts. Handled
             // before the gesture machinery rather than inside it so a drag
@@ -5615,8 +3915,6 @@ void loop() {
                             enterSettings();
                         } else if (pending == SettingsRow::RESET_STATS) {
                             engine.resetLifetime();
-                            Dex::reset();
-                            Regulars::reset();
                         } else if (pending == SettingsRow::BORING_MODE) {
                             Settings::toggleBoringMode();
                         } else if (pending == SettingsRow::REPLAY_INTRO) {
@@ -5636,7 +3934,6 @@ void loop() {
                 gestureStartX = tp.x;
                 gestureStartY = tp.y;
                 lastY = tp.y;
-                gestureDownMs = now;
             }
             if (tp.valid && gestureActive) {
                 int dy = tp.y - lastY;
@@ -5647,10 +3944,6 @@ void loop() {
                 }
             }
             if (touchJustUp && gestureActive) {
-                if (!gestureMoved && now - gestureDownMs > TAP_MAX_MS) {
-                    gestureActive = false;
-                    break;
-                }
                 if (!gestureMoved) {
                     lastTouch = now;
                     // The pinned strip along the bottom: up a level from a
@@ -5673,9 +3966,12 @@ void loop() {
                         gestureActive = false;
                         break;
                     }
-                    // Headings are labels. They used to fold their group away,
-                    // which nobody found on purpose and everybody found by
-                    // accident; a tap on one lands on no row and does nothing.
+                    // A heading folds its group away. Spends the tap.
+                    if (uiSettingsTapHeader(*canvas, gestureStartX, gestureStartY,
+                                             tft.width(), tft.height())) {
+                        gestureActive = false;
+                        break;
+                    }
                     SettingsRow row = uiSettingsHitTest(*canvas, gestureStartX, gestureStartY, tft.width(), tft.height());
                     // Switched off by a mode: say so, rather than doing nothing
                     // and reading as a broken row.
@@ -5703,11 +3999,7 @@ void loop() {
                         case SettingsRow::BACKGROUND: Settings::cycleBackground(); break;
                         case SettingsRow::BACKGROUND_LOCK: Settings::toggleBackgroundLocked(); break;
                         case SettingsRow::UPDATE_CHECK:    Settings::toggleUpdateCheck();     break;
-                        case SettingsRow::TIME_ZONE:
-                            // Left half back, right half forward -- see the row's label.
-                            Settings::stepTimeZone(gestureStartX < tft.width() / 2 ? -1 : 1);
-                            Settings::markTimeZoneChosen();
-                            break;
+                        case SettingsRow::TIME_ZONE:       Settings::cycleTimeZone();         break;
                         case SettingsRow::INVERT:
                             Settings::toggleInvert();
                             // XOR against the panel's own baseline, not an
@@ -5725,64 +4017,8 @@ void loop() {
                             break;
                         case SettingsRow::CONFIDENCE: Settings::cycleMinConfidence(); break;
                         case SettingsRow::AUTO_QUIET:  Settings::cycleAutoQuiet(); break;
-#if defined(CROWPANEL7)
-                        case SettingsRow::BUZZER:
-                            // Switching it ON plays the chirp once, the job the
-                            // light's TEST row does: the owner hears what they
-                            // signed up for before a camera does. OFF is silent.
-                            Settings::toggleBuzzer();
-                            if (Settings::buzzerOn()) CrowBuzzer::chirp(BUZZ_CHIRP_MS);
-                            break;
-#endif
                         case SettingsRow::DETECTION_FILTER: enterDetFilter(); break;
                         case SettingsRow::POWER_SAVER: enterPower(); break;
-#if defined(ESP32) && !defined(TWATCH_S3)
-                        case SettingsRow::CHARGE_MODE: s_chargeWanted = true; break;
-                        case SettingsRow::LAST_RUN: break;   // a reading, not a switch
-#endif
-#if defined(TWATCH_S3)
-                        case SettingsRow::WATCH_RADIO: Settings::cycleRadioDuty(); break;
-                        case SettingsRow::WATCH_LISTEN: Settings::cycleBleListen(); break;
-                        case SettingsRow::WATCH_IDLE_CPU: Settings::cycleIdleCpu(); applyCpuClock(); break;
-                        case SettingsRow::WATCH_BATTERY: break;   // a reading, not a switch
-                        case SettingsRow::WATCH_TEMP: break;   // a reading, not a switch
-                        case SettingsRow::WATCH_SETTINGS: uiSettingsOpenPage(SettingsPage::WATCH); break;
-                        case SettingsRow::WATCH_QUIET_TAGS:
-                            Settings::toggleQuietTrackers();
-                            Theme::showToast("TAGS + RINGS", Settings::quietTrackers() ? "Logged, no wake or buzz" : "Alert like the rest",
-                                             Theme::CYAN);
-                            break;
-#if SQUACH_LORA
-                        case SettingsRow::WATCH_LORA:
-                            Settings::cycleLoraListen();
-                            Lora::applyListen(Settings::loraListen());
-                            Theme::showToast("LORA", Settings::loraListenName(), Theme::CYAN);
-                            break;
-                        case SettingsRow::WATCH_LORA_CHATS: enterLoraChat(); break;
-#endif
-                        case SettingsRow::WATCH_WARDRIVE:
-                            // Through the console's own path, so the row and
-                            // WARDRIVE ON/OFF can never disagree about what
-                            // switching it does (the GPS goes with it).
-                            g_consoleGps = Wardrive::enabled() ? 6 : 5;
-                            Theme::showToast(Wardrive::enabled() ? "WARDRIVE OFF" : "WARDRIVE ON",
-                                             Wardrive::enabled() ? nullptr : "Logging once the GPS has a fix",
-                                             Theme::CYAN);
-                            break;
-                        case SettingsRow::WATCH_BUZZ:
-                            // OFF, HIGH, MED, LOW. Each level plays the alert
-                            // pattern once, so the choice is made by feel; OFF
-                            // stays silent, so the tap never feels like a test
-                            // that passed while alerts are actually off.
-                            Settings::cycleBuzz();
-                            if (Settings::buzz()) {
-                                drvWrite(0x01, 0x00);
-                                twatchHapticApply();
-                                twatchBuzz(Buzz::SAMPLE);
-                            }
-                            Serial.printf("[buzz] %s\n", Settings::buzzModeName());
-                            break;
-#endif
                         case SettingsRow::STATUS_LIGHT: enterLight(); break;
                         case SettingsRow::SECURITY:    enterSecurity(); break;
                         case SettingsRow::IGNORED_DEVICES:  enterIgnoreList(); break;
@@ -5852,7 +4088,6 @@ void loop() {
                         case SettingsRow::BANTER:       Settings::cycleBanter(); break;
                         case SettingsRow::VIEW_DIARY:   enterDiary(); break;
                         case SettingsRow::BINGO:        enterBingo(); break;
-                        case SettingsRow::DEX:          enterDex(); break;
                         case SettingsRow::APPEARANCE:  uiSettingsOpenAppearance(true); break;
                         case SettingsRow::TOP_HAT:     Settings::toggleTopHat(); break;
                         // From a sub-page, back to the main list; from the
@@ -6009,7 +4244,7 @@ void loop() {
                         break;
                     }
                     case UpdateHit::RESCAN:    OtaWifi::rescan();   break;
-                    case UpdateHit::INSTALL:   lendFrameToDownload(); OtaWifi::install(); break;
+                    case UpdateHit::INSTALL:   OtaWifi::install();  break;
                     case UpdateHit::TRY_AGAIN: OtaWifi::tryAgain(); break;
                     case UpdateHit::BT_START:
                         // The radio first: NimBLE will not register the update
@@ -6353,14 +4588,12 @@ void loop() {
             static bool gestureMoved  = false;
             static int  gestureStartX = 0, gestureStartY = 0;
             static int  lastY = -1;
-            static uint32_t gestureDownMs = 0;
             if (touchJustDown) {
                 gestureActive = true;
                 gestureMoved  = false;
                 gestureStartX = tp.x;
                 gestureStartY = tp.y;
                 lastY = tp.y;
-                gestureDownMs = now;
             }
             if (tp.valid && gestureActive) {
                 int dy = tp.y - lastY;
@@ -6371,13 +4604,13 @@ void loop() {
                 }
             }
             if (touchJustUp && gestureActive) {
-                if (!gestureMoved && now - gestureDownMs <= TAP_MAX_MS && Theme::pinnedBackHit(gestureStartX, gestureStartY, tft.width(), tft.height())) {
+                if (!gestureMoved && Theme::pinnedBackHit(gestureStartX, gestureStartY, tft.width(), tft.height())) {
                     gestureActive = false;
                     lastTouch = now;
                     enterSettings();
                     break;
                 }
-                if (!gestureMoved && now - gestureDownMs <= TAP_MAX_MS) {
+                if (!gestureMoved) {
                     lastTouch = now;
                     DetectionType hit = uiDetFilterHitTest(*canvas, gestureStartX, gestureStartY, tft.width(), tft.height());
                     // iBeacons ask first, on the way ON only: see
@@ -6412,10 +4645,9 @@ void loop() {
             // The same drag-to-scroll, act-on-release gesture as POWER SAVER.
             static bool gestureActive = false, gestureMoved = false;
             static int  gestureStartX = 0, gestureStartY = 0, lastY = -1;
-            static uint32_t gestureDownMs = 0;
             if (touchJustDown) {
                 gestureActive = true; gestureMoved = false;
-                gestureStartX = tp.x; gestureStartY = tp.y; lastY = tp.y; gestureDownMs = now;
+                gestureStartX = tp.x; gestureStartY = tp.y; lastY = tp.y;
             }
             if (tp.valid && gestureActive) {
                 int dy = tp.y - lastY;
@@ -6423,12 +4655,12 @@ void loop() {
             }
             if (touchJustUp && gestureActive) {
                 gestureActive = false;
-                if (!gestureMoved && now - gestureDownMs <= TAP_MAX_MS && Theme::pinnedBackHit(gestureStartX, gestureStartY, tft.width(), tft.height())) {
+                if (!gestureMoved && Theme::pinnedBackHit(gestureStartX, gestureStartY, tft.width(), tft.height())) {
                     lastTouch = now;
                     enterSettings();
                     break;
                 }
-                if (!gestureMoved && now - gestureDownMs <= TAP_MAX_MS) {
+                if (!gestureMoved) {
                     lastTouch = now;
                     const bool on = Security::enabled();
                     // Everything below PIN LOCK is inert until a PIN exists,
@@ -6581,10 +4813,9 @@ void loop() {
             static bool gestureMoved  = false;
             static int  gestureStartX = 0, gestureStartY = 0;
             static int  lastY = -1;
-            static uint32_t gestureDownMs = 0;
             if (touchJustDown) {
                 gestureActive = true; gestureMoved = false;
-                gestureStartX = tp.x; gestureStartY = tp.y; lastY = tp.y; gestureDownMs = now;
+                gestureStartX = tp.x; gestureStartY = tp.y; lastY = tp.y;
             }
             if (tp.valid && gestureActive) {
                 int dy = tp.y - lastY;
@@ -6595,13 +4826,13 @@ void loop() {
                 }
             }
             if (touchJustUp && gestureActive) {
-                if (!gestureMoved && now - gestureDownMs <= TAP_MAX_MS && Theme::pinnedBackHit(gestureStartX, gestureStartY, tft.width(), tft.height())) {
+                if (!gestureMoved && Theme::pinnedBackHit(gestureStartX, gestureStartY, tft.width(), tft.height())) {
                     gestureActive = false;
                     lastTouch = now;
                     enterSettings();
                     break;
                 }
-                if (!gestureMoved && now - gestureDownMs <= TAP_MAX_MS) {
+                if (!gestureMoved) {
                     lastTouch = now;
                     PowerRow hit = uiPowerHitTest(*canvas, gestureStartX, gestureStartY,
                                                   tft.width(), tft.height());
@@ -6629,11 +4860,6 @@ void loop() {
                             applyCpuClock();
                             break;
                         case PowerRow::WAKE_ON_ALERT: Settings::toggleWakeOnAlert(); break;
-#if defined(TWATCH_S3)
-                        case PowerRow::RADIO_DUTY:    Settings::cycleRadioDuty(); break;
-#endif
-#if defined(TWATCH_S3)
-#endif
                         default: break;
                     }
                 }
@@ -6641,53 +4867,15 @@ void loop() {
             }
             break;
         }
-#if SQUACH_LORA
-        case AppState::LORA_CHAT: {
-            drawTwoBand([&](TFT_eSPI& t, bool) { uiLoraChatTick(t, now); });
-            static bool gestureActive = false;
-            static bool gestureMoved  = false;
-            static int  gestureStartX = 0, gestureStartY = 0;
-            static int  lastY = -1;
-            static uint32_t gestureDownMs = 0;
-            if (touchJustDown) {
-                gestureActive = true; gestureMoved = false;
-                gestureStartX = tp.x; gestureStartY = tp.y; lastY = tp.y; gestureDownMs = now;
-            }
-            if (tp.valid && gestureActive) {
-                const int dy = tp.y - lastY;
-                if (abs(dy) > 24) {
-                    gestureMoved = true;
-                    uiLoraChatScroll(dy > 0 ? -1 : 1);   // drag down: newer
-                    lastY = tp.y;
-                }
-            }
-            if (touchJustUp && gestureActive) {
-                gestureActive = false;
-                if (!gestureMoved && now - gestureDownMs <= TAP_MAX_MS) {
-                    lastTouch = now;
-                    if (Theme::pinnedBackHit(gestureStartX, gestureStartY, tft.width(), tft.height())) {
-                        enterSettings();
-                        uiSettingsOpenPage(SettingsPage::WATCH);
-                        break;
-                    }
-                    const LoraChatHit hit = uiLoraChatHit(*canvas, gestureStartX, gestureStartY);
-                    if (hit == LoraChatHit::TAB_MESHTASTIC) uiLoraChatSelect(0);
-                    else if (hit == LoraChatHit::TAB_MESHCORE) uiLoraChatSelect(1);
-                }
-            }
-            break;
-        }
-#endif
         case AppState::STATUS_LIGHT: {
             drawTwoBand([&](TFT_eSPI& t, bool) { uiLightTick(t, now, engine); });
             static bool gestureActive = false;
             static bool gestureMoved  = false;
             static int  gestureStartX = 0, gestureStartY = 0;
             static int  lastY = -1;
-            static uint32_t gestureDownMs = 0;
             if (touchJustDown) {
                 gestureActive = true; gestureMoved = false;
-                gestureStartX = tp.x; gestureStartY = tp.y; lastY = tp.y; gestureDownMs = now;
+                gestureStartX = tp.x; gestureStartY = tp.y; lastY = tp.y;
             }
             if (tp.valid && gestureActive) {
                 int dy = tp.y - lastY;
@@ -6698,14 +4886,14 @@ void loop() {
                 }
             }
             if (touchJustUp && gestureActive) {
-                if (!gestureMoved && now - gestureDownMs <= TAP_MAX_MS && Theme::pinnedBackHit(gestureStartX, gestureStartY, tft.width(), tft.height())) {
+                if (!gestureMoved && Theme::pinnedBackHit(gestureStartX, gestureStartY, tft.width(), tft.height())) {
                     gestureActive = false;
                     lastTouch = now;
                     enterSettings();
                     uiSettingsOpenAppearance(true);
                     break;
                 }
-                if (!gestureMoved && now - gestureDownMs <= TAP_MAX_MS) {
+                if (!gestureMoved) {
                     lastTouch = now;
                     LightRow hit = uiLightHitTest(*canvas, gestureStartX, gestureStartY,
                                                   tft.width(), tft.height());
@@ -6742,7 +4930,8 @@ void loop() {
                     alertMayInterrupt(*latest)) {
                     uiDeskAlert(*latest, now);
                     lastAlertType = latest->type;
-                    squachyCatch(latest->type, latest->mac, latest->hits, latest->rssi, latest->conf);
+                    Squachy::trigger(Squachy::Event::DETECTION, latest->type, engine.lifetimeTotal(),
+                                     latest->hits, latest->rssi, latest->conf);
                 }
             }
             // The toast goes inside: anything drawn after the bands are
@@ -6817,9 +5006,7 @@ void loop() {
                 info.calB0 = (int16_t)lroundf(b0); info.calB1 = (int16_t)lroundf(b1);
             }
             info.usingCapTouch = usingCapTouch;
-#if defined(CROWPANEL7)
-            info.boardName = "CrowPanel 7";
-#elif defined(TOUCH_ON_DISPLAY_BUS)
+#if defined(TOUCH_ON_DISPLAY_BUS)
             info.boardName = "AWOK";
 #elif defined(CYD35)
             info.boardName = "cyd35 BETA";
@@ -6968,21 +5155,19 @@ void loop() {
         static uint32_t lastFrameSay = 0;
         if (s_frameUsAvg && now - lastFrameSay >= 10000) {
             lastFrameSay = now;
-            const uint32_t loopsPerS = s_loopsSinceSay / 10;
-            s_loopsSinceSay = 0;
             FrameProf::print();
 #if defined(CYD35)
             // Measurement, not a feature: where the 3.5"'s frame really goes.
             Serial.printf("[bands] draw %lu / %lu us   hash %lu us   wire %lu us   rows %ld\n",
                           (unsigned long)s_bandUs[0], (unsigned long)s_bandUs[1],
                           (unsigned long)FramePush::hashUs(), (unsigned long)FramePush::wireUs(),
-                          (long)SQW_PUSH_ROWS());
+                          (long)FramePush::lastRows());
 #endif
             const volatile uint32_t* ak = advertKinds();
-            Serial.printf("[frame] avg %lu.%lu ms (%lu fps, loop %lu/s)  push %lu.%lu ms (%ld rows)  screen %u  bg %u  heap %lu/%lu  wifi %lu  ble %lu/s  adv %lu  kinds %lu/%lu/%lu/%lu/%lu  det %lu\n",
+            Serial.printf("[frame] avg %lu.%lu ms (%lu fps)  push %lu.%lu ms (%ld rows)  screen %u  bg %u  heap %lu/%lu  wifi %lu  ble %lu/s  adv %lu  kinds %lu/%lu/%lu/%lu/%lu  det %lu\n",
                           (unsigned long)(s_frameUsAvg / 1000), (unsigned long)((s_frameUsAvg / 100) % 10),
-                          (unsigned long)(1000000UL / s_frameUsAvg), (unsigned long)loopsPerS,
-                          (unsigned long)(s_pushUsAvg / 1000), (unsigned long)((s_pushUsAvg / 100) % 10), (long)SQW_PUSH_ROWS(),
+                          (unsigned long)(1000000UL / s_frameUsAvg),
+                          (unsigned long)(s_pushUsAvg / 1000), (unsigned long)((s_pushUsAvg / 100) % 10), (long)FramePush::lastRows(),
                           (unsigned)state, (unsigned)Settings::background(), (unsigned long)ESP.getFreeHeap(),
                           (unsigned long)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT),
                           (unsigned long)wifiFramesSeen(), (unsigned long)advertRate(), (unsigned long)advertsSeen(),
@@ -7007,40 +5192,8 @@ void loop() {
         const bool alerting = (state == AppState::ALERT || state == AppState::WATCH_ALERT);
         const uint16_t timeoutSec = Settings::screenTimeoutSec();
         // Desk mode is a clock; a clock that goes dark is not there.
-        bool wantDim = timeoutSec && idleMs > (uint32_t)timeoutSec * 1000UL &&
-                       !(Settings::wakeOnAlert() && alerting) && state != AppState::DESK;
-#if defined(TWATCH_S3)
-        // On the cable the watch stays lit; on battery the timeout always runs
-        // (see Settings::screenTimeoutSec), unless it is set to NEVER.
-        if (s_onUsb) wantDim = false;
-        // The crown, which beats the cable, the desk and a timeout of NEVER.
-        // A touch since the press, or an alert that wants the screen, ends it.
-        //
-        // An alert lights it without ending it: once the alert is over the
-        // screen goes dark again after the screen timeout (30 s when that is
-        // NEVER), the way it would on battery. Taps on the alert card -- the
-        // one that dismisses it above all -- do not count as the touch that
-        // ends crown mode; a touch after that does.
-        {
-            static bool wasAlerting = false;
-            if (s_crownDark) {
-                if (alerting || wasAlerting) s_crownDarkAt = now;
-                if (wasAlerting && !alerting) {
-                    uint32_t t = Settings::screenTimeoutSecRaw();
-                    if (!t) t = 30;
-                    s_crownLitUntil = now + t * 1000UL;
-                    if (!s_crownLitUntil) s_crownLitUntil = 1;
-                }
-                if ((int32_t)(lastTouch - s_crownDarkAt) > 0) s_crownDark = false;
-            }
-            wasAlerting = alerting;
-        }
-        if (s_crownDark) {
-            const bool alertWants = Settings::wakeOnAlert() && alerting;
-            const bool lit = s_crownLitUntil && (int32_t)(s_crownLitUntil - now) > 0;
-            wantDim = !alertWants && !lit;
-        }
-#endif
+        const bool wantDim = timeoutSec && idleMs > (uint32_t)timeoutSec * 1000UL &&
+                             !(Settings::wakeOnAlert() && alerting) && state != AppState::DESK;
         if (wantDim != s_screenDimmed) {
             s_screenDimmed = wantDim;
             applyBrightness();
@@ -7069,14 +5222,6 @@ void loop() {
         // because the panel push is fast. On the 40 MHz build there is no idle
         // time left to hand over, so the faster SPI clock is what makes this
         // saving possible rather than something to trade against it.
-#if defined(TWATCH_S3)
-        // Asleep, the loop only needs to hear the radios and feel a tap:
-        // ten passes a second is plenty, and the rest of the time is idle.
-        if (s_panelAsleep) {
-            const uint32_t spentUs = micros() - frameStartUs;
-            if (spentUs < 100000UL) delay((100000UL - spentUs) / 1000UL);
-        }
-#endif
         const uint8_t fps = Settings::idleFps();
         if (fps && idleMs > (uint32_t)Settings::idleAfterSec() * 1000UL) {
             const uint32_t budgetUs = 1000000UL / fps;
@@ -7117,11 +5262,6 @@ void loop() {
         lc.screenDimmed = s_screenDimmed;
         lc.screenDark   = s_screenDimmed && Settings::dimLevel() == 0;
         StatusLight::tick(now, lc);
-#if defined(CROWPANEL7)
-        // Every pass in every state, so the chirp's OFF lands whatever
-        // screen the alert opened.
-        CrowBuzzer::tick();
-#endif
     }
     prevTouchValid = tp.valid;
 }

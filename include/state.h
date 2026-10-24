@@ -121,11 +121,6 @@ struct Detection {
     // the type. See lookupOui().
     Confidence     conf;
     bool           active;
-    // When it last asked to interrupt, allowed or not, in minutes of uptime
-    // (wrapping after 45 days). A device that keeps coming back keeps asking,
-    // so the gap since the last ask is how long it was really gone. Sits in
-    // what was padding.
-    uint16_t       askedMin;
 };
 
 // A detection's vendor, safe to print. A record is zeroed before it is
@@ -190,10 +185,8 @@ enum class AppState : uint8_t {
                             // frame after the intro. See ui_sysprops.h.
     // 36 was CROWD, a page holding one setting; the SquachMesh menu's CROWD
     // row steps it in place now.
-    BINGO            = 36, // the detection bingo card, from Settings' BINGO
+    BINGO            = 36  // the detection bingo card, from Settings' BINGO
                             // row. See ui_bingo.h.
-    DEX              = 37, // the SQUACHY-DEX, from Settings' row. See ui_dex.h.
-    LORA_CHAT        = 38  // LORA CHATS, from WATCH SETTINGS (SQUACH_LORA builds). See ui_lorachat.h.
 };
 
 enum class ButtonId : uint8_t {

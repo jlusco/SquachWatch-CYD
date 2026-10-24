@@ -37,16 +37,12 @@ Geom geom(TFT_eSPI& t) {
     g.backY = h - BTN_H - 6;
     g.switchY = g.backY - BTN_H - 8;
     g.squadY  = OtaCore::otherVersion() ? g.switchY - BTN_H - 8 : g.switchY;
-    // Stacked upward from SQUAD: Bluetooth only where the board has it (the
-    // CYDs dropped it; see nimble_flags_cyd), and WiFi takes its place.
 #if SQUACH_MESH
-    int above = g.squadY - BTN_H - 8;
+    g.btY     = g.squadY - BTN_H - 8;
 #else
-    int above = g.squadY;
+    g.btY     = g.squadY;
 #endif
-    g.btY     = above;
-    if (OtaBle::available()) above -= BTN_H + 8;
-    g.wifiY   = above;
+    g.wifiY   = g.btY - BTN_H - 8;
     return g;
 }
 
@@ -152,8 +148,7 @@ void drawMenu(TFT_eSPI& t) {
     pair(t, y, "OTHER SLOT", other ? other : "nothing to switch to");
 
     Theme::drawWin95Button(t, g.x, g.wifiY, g.w, BTN_H, "UPDATE OVER WIFI", false);
-    if (OtaBle::available())
-        Theme::drawWin95Button(t, g.x, g.btY,   g.w, BTN_H, "UPDATE OVER BLUETOOTH (BETA)", false);
+    Theme::drawWin95Button(t, g.x, g.btY,   g.w, BTN_H, "UPDATE OVER BLUETOOTH (BETA)", false);
 #if SQUACH_MESH
     Theme::drawWin95Button(t, g.x, g.squadY, g.w, BTN_H, "UPDATE SQUAD", false);
 #endif
@@ -494,7 +489,7 @@ UpdateHit uiUpdateHitTest(TFT_eSPI& t, int x, int y, int* netIndex) {
                 return UpdateHit::NONE;
             }
             if (in(x, y, g.x, g.wifiY, g.w, BTN_H)) return UpdateHit::WIFI_START;
-            if (OtaBle::available() && in(x, y, g.x, g.btY, g.w, BTN_H)) return UpdateHit::BT_START;
+            if (in(x, y, g.x, g.btY,   g.w, BTN_H)) return UpdateHit::BT_START;
 #if SQUACH_MESH
             if (in(x, y, g.x, g.squadY, g.w, BTN_H)) return UpdateHit::SQUAD_START;
 #endif

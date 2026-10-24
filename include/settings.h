@@ -6,7 +6,6 @@
 // stay in main.cpp, which reads these getters after a change.
 #pragma once
 #include <stdint.h>
-#include <stddef.h>
 #include "signatures.h"   // Confidence
 
 namespace Settings {
@@ -197,132 +196,11 @@ namespace Settings {
     uint16_t   cpuMhz();
     void       cycleCpuMhz();
 
-    // The watch's two battery knobs, both only while POWER SAVER is on.
-    // BLE LISTEN: how much of each 100 ms the Bluetooth receiver is open,
-    // 25, 50 or 75 percent. The receiver is the watch's whole battery story
-    // (about 100 mA whenever it is open), and a tracker announcing itself
-    // every second or two is still caught within seconds at 25. Off the
-    // watch this reads 75, the window every board has always run.
-    uint8_t    bleListen();
-    uint8_t    bleListenRaw();
-    void       cycleBleListen();
-    // SLEEP CPU: the core clock while the screen is asleep, 80, 160 or 240.
-    // The screen-on clock is CPU CLOCK above; this one never goes above it.
-    uint16_t   idleCpuMhz();
-    uint16_t   idleCpuMhzRaw();
-    void       cycleIdleCpu();
-
     // Whether an alert pulls the backlight back up. On by default: a
     // detector that dims itself and then hides the alert it just found is
     // worse than useless.
     bool       wakeOnAlert();
     void       toggleWakeOnAlert();
-    // TAGS + RINGS on the watch: AirTags, Tiles, Samsung and Google tags and
-    // Ring cameras are logged but never interrupt -- no card, no buzz, no
-    // screen waking. On by default: a commute is fifty AirTags an hour.
-    // How long each of the last few boots ran, in minutes, newest first --
-    // the runtime log for boards that cannot read their battery. main.cpp
-    // notes the running boot every ten minutes; the entry for a boot that
-    // ended is how long it lasted (to within ten minutes).
-    void       noteRunMinutes(uint16_t boot, uint16_t minutes);
-    uint8_t    runHistory(uint16_t* boots, uint16_t* minutes, uint8_t cap);
-    bool       quietTrackers();
-    void       toggleQuietTrackers();
-    // Set the first time this watch's GPS answers: it is an S3 Plus, whose
-    // bigger cell takes a faster charge. Never cleared by a GPS that is
-    // merely switched off.
-    bool       watchPlus();
-    void       setWatchPlus();
-    // The T-Watch's buzz on an alert (the DRV2605 haptic motor). Kept on
-    // every board so the settings file reads the same; only the watch has
-    // a motor to use it.
-    // One row: OFF, HIGH, MED, LOW. buzz() is "not OFF"; buzzStrength() is
-    // 0 LOW, 1 MED, 2 HIGH, which picks the motor driver's effect library
-    // (1 is meant for a 1.3 V motor, 2 for a 3 V one -- the watch's is 3 V),
-    // the patterns, and at HIGH lifts the drive clamp a little too.
-    bool       buzz();
-    uint8_t    buzzStrength();
-    const char* buzzModeName();
-    void       cycleBuzz();
-
-    // The watch's radio duty cycle; see RADIO_DUTY_NAMES in settings.cpp.
-    // 0 when the saver is off. Watch only.
-    uint8_t     radioDuty();
-    uint8_t     radioDutyRaw();
-    const char* radioDutyName(uint8_t ix);
-    void        cycleRadioDuty();
-
-    // ---- BUZZER ----------------------------------------------------------
-    // The CrowPanel 7's buzzer, behind the helper MCU that runs its backlight.
-    // OFF by default, and ON means one chirp for a device this board has not
-    // logged before, at the moment the alert goes up -- never for one coming
-    // back, never with the screen dimmed, never at night. The rules live with
-    // the hook in main.cpp (alertMayInterrupt); this is only the switch.
-    // Boards without a buzzer never show the row; the value is kept on all
-    // of them so a saved preference travels, the way the light's knobs do.
-    bool        buzzerOn();
-    void        toggleBuzzer();
-
-    // ---- LORA ------------------------------------------------------------
-    // The wireless slot: OFF, FOCUS on one profile, or SURVEY over the band
-    // (Lora::Mode's values), and which profile FOCUS parks on (an index into
-    // lora_profiles.cpp's table). Only the CrowPanel 7 shows the rows; the
-    // values are kept everywhere, like the buzzer's.
-    uint8_t     loraMode();
-    void        cycleLoraMode();
-    // Which band plan the sniffer listens to: 0 AUTO (the Americas' time
-    // zones get US 915, everywhere else EU 868), 1 EU, 2 US. Read at boot.
-    // The watch's LORA row: 0 OFF, 1 MESHTASTIC, 2 MESHCORE, 3 BOTH (the
-    // default: the radio takes turns between the two). Applied by
-    // Lora::applyListen().
-    uint8_t     loraListen();
-    void        cycleLoraListen();
-    const char* loraListenName();
-    uint8_t     loraRegion();
-    void        setLoraRegion(uint8_t r);
-    uint8_t     loraFocus();
-    void        setLoraFocus(uint8_t ix);
-
-    // ONLINE LOOKUPS: whether this board may ask a public service about a node
-    // it heard. Four switches, not one, because a master alone cannot say
-    // "aircraft yes, callsigns no" -- which is the setting a careful operator
-    // actually wants. All four default OFF, and that is the one place this
-    // differs in shape from updateCheck() below: that switch talks to
-    // first-party infrastructure about THIS board and defaults ON, these talk
-    // to third parties about OTHER PEOPLE. What each one sends, and the
-    // measured harm behind the default, is in include/lora_enrich.h.
-    //
-    // The fourth is a different KIND of request and still defaults off. The
-    // MeshCore adverts feed sends a row count and nothing else -- no key, no
-    // prefix, no name, nothing about what this board heard (include/lora_feed.h)
-    // -- so it is the one source here that cannot betray anything even in
-    // principle. It is off by default anyway: this board does not join a
-    // network unasked, whatever the request would have said.
-    bool        loraLookups();           // the master
-    void        toggleLoraLookups();
-    bool        loraLookupCall();        // hamrig.com, for APRS and MeshCom callsigns
-    void        toggleLoraLookupCall();
-    bool        loraLookupOgn();         // the OGN device database, for FANET
-    void        toggleLoraLookupOgn();
-    bool        loraLookupFeed();        // meshcore.df0x.de recent adverts, to name MeshCore rows
-    void        toggleLoraLookupFeed();
-
-    // The channel keys the two mesh decoders hold, as one opaque blob. The
-    // record format is Lora::Chan's business (include/lora_channels.h); this
-    // is only the NVS entry, so that the store stays the one place that talks
-    // to Preferences.
-    //
-    // ONE entry for the whole list, for the reason the egg-hunt progress is
-    // packed into one: thirty channels would be thirty entries in a store
-    // with a few hundred free, and a channel list is not what that budget is
-    // for. Key "loraChans" -- 9 characters, inside NVS's limit of 15, and no
-    // other key in settings.cpp begins with those letters.
-    size_t      loraChannels(uint8_t* out, size_t cap);        // bytes read; 0 = nothing stored
-    // n == 0 removes the entry. False when the store would not take it -- a
-    // full NVS partition, say. That has to be reported rather than swallowed:
-    // a write that silently fails is a board that silently forgets its keys
-    // again, which is the whole bug this entry exists to fix.
-    bool        setLoraChannels(const uint8_t* rec, size_t n);
 
     // ---- STATUS LIGHT ----------------------------------------------------
     // The RGB LED on the back of the 2.8" CYD. See status_light.h for the
@@ -350,7 +228,7 @@ namespace Settings {
     uint8_t     lightColor();            // 0 THEME, 1..9 fixed colours, 10 BACKGROUND
     void        cycleLightColor();
     const char* lightColorName();
-    uint8_t     lightBrightness();       // 1..7, caps everything
+    uint8_t     lightBrightness();       // 1..5, caps everything
     void        cycleLightBrightness();
 
     // REMOTE UPDATE: whether a squad update nudge over SquachMesh may start
@@ -401,7 +279,6 @@ namespace Settings {
     // ALERT screen before it has to earn the next one by coming CLOSER.
     // 0 is off. Nothing is actually silenced -- see Detection::quietBar --
     // which matters on a device whose job is telling you what is near you.
-    // On the watch, POWER SAVER makes it five at most.
     uint8_t     autoQuietAfter();
     void        cycleAutoQuiet();
     const char* autoQuietLabel();
@@ -519,6 +396,52 @@ namespace Settings {
     void        cycleSquachySize();
     void     toggleType(DetectionType t);
     uint8_t  enabledTypeCount();   // for a Settings-row "12/14" summary
+
+    // LoRa settings: a minimal, persisted config surface for the LoRa radio
+    // and its channel list. These defaults are intentionally conservative so a
+    // freshly built board does not silently enable a radio path it does not yet
+    // know about.
+    uint8_t     loraListen();
+    const char* loraListenName();
+    void        setLoraListen(uint8_t v);
+    uint8_t     loraRegion();
+    void        setLoraRegion(uint8_t v);
+    const char* loraMtPreset();
+    void        setLoraMtPreset(const char* s);
+    uint8_t     loraTxDbm();
+    const char* loraTxName();
+    void        setLoraTxDbm(uint8_t v);
+    uint8_t     loraHops();
+    void        setLoraHops(uint8_t v);
+    const char* loraName();
+    void        setLoraName(const char* s);
+    const char* loraShortName();
+    void        setLoraShortName(const char* s);
+    bool        loraAnnounce();
+    void        setLoraAnnounce(bool v);
+    bool        loraMsgSound();
+    void        setLoraMsgSound(bool v);
+    uint8_t     loraDetect();
+    const char* loraDetectName();
+    void        setLoraDetect(uint8_t v);
+    bool        loraAlerts();
+    void        setLoraAlerts(bool v);
+    bool        loraLookups();
+    void        setLoraLookups(bool v);
+    bool        loraLookupCall();
+    void        setLoraLookupCall(bool v);
+    bool        loraLookupOgn();
+    void        setLoraLookupOgn(bool v);
+    bool        loraLookupFeed();
+    void        setLoraLookupFeed(bool v);
+    uint8_t     loraMode();
+    void        setLoraMode(uint8_t v);
+    uint8_t     loraFocus();
+    void        setLoraFocus(uint8_t v);
+    const char* loraTxChan(bool meshcore);
+    void        setLoraTxChan(bool meshcore, const char* s);
+    size_t      loraChannels(uint8_t* out, size_t cap);
+    bool        setLoraChannels(const uint8_t* in, size_t len);
 
     // How far along an unfinished easter-egg hunt is, kept across restarts.
     // The unlocks themselves have always been saved; this is the PROGRESS
